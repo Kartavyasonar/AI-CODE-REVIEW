@@ -20,7 +20,15 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(title="AI Code Review Agent v2", version="2.0.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["https://ai-code-review-frontend-lkuq.onrender.com"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://ai-code-review-frontend-lkuq.onrender.com"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 class ReviewRequest(BaseModel):
