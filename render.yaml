@@ -9,7 +9,7 @@ services:
       - key: GROQ_API_KEY
         sync: false          # You enter this manually in Render dashboard
       - key: PYTHON_VERSION
-        value: 3.12.0
+        value: 3.11
     disk:
       name: memory-store
       mountPath: /opt/render/project/src/memory_db
