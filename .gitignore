@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Environment
+.env
+.env.local
+
+# Data stores (don't commit DB files)
+chroma_db/
+memory_db/
+*.db
+
+# Temp repo clones
+/tmp/
+codereview_*/
+
+# Node
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Reports
+code_review_report.md
