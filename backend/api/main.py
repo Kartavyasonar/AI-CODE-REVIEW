@@ -28,9 +28,11 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
-
-
+@app.options("/{full_path:path}")
+async def preflight_handler(full_path: str):
+    return {"message": "OK"}
 class ReviewRequest(BaseModel):
     repo_url: str
 
