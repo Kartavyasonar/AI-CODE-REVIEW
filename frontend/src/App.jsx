@@ -1,8 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 
-const API = typeof window !== "undefined" && window.location.hostname !== "localhost"
-  ? "https://ai-code-review-backend-4b80.onrender.com"  
-  : "http://localhost:8000";
+const API = "";
 
 // ── Theme ──────────────────────────────────────────────────────────────────
 const T = {

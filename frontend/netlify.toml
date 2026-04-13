@@ -1,0 +1,16 @@
+[[redirects]]
+  from = "/review/*"
+  to = "https://ai-code-review-backend-4b80.onrender.com/review/:splat"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/health"
+  to = "https://ai-code-review-backend-4b80.onrender.com/health"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
