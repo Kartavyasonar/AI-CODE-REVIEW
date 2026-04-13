@@ -7,12 +7,11 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 
-# Job store: { job_id: { status, steps, findings, ... } }
 jobs: dict = {}
 
 @asynccontextmanager
@@ -20,19 +19,29 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(title="AI Code Review Agent v2", version="2.0.0", lifespan=lifespan)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://ai-code-review-frontend-lkuq.onrender.com"
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=["*"],
 )
-@app.options("/{full_path:path}")
-async def preflight_handler(full_path: str):
-    return {"message": "OK"}
+
+@app.options("/{rest_of_path:path}")
+async def preflight(rest_of_path: str, request: Request):
+    return Response(
+        status_code=200,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept",
+            "Access-Control-Max-Age": "86400",
+        },
+    )
+
+
 class ReviewRequest(BaseModel):
     repo_url: str
 
