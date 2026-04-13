@@ -1,7 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 
-const API = "";
-
+const API = "https://ai-code-review-backend-4b80.onrender.com";
 // ── Theme ──────────────────────────────────────────────────────────────────
 const T = {
   bg:      "#0a0a0f",
