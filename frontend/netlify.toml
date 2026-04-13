@@ -1,3 +1,16 @@
+[build]
+  base = "frontend"
+  command = "npm install && npm run build"
+  publish = "dist"
+
+[[redirects]]
+  from = "/review"
+  to = "https://ai-code-review-backend-4b80.onrender.com/review"
+  status = 200
+  force = true
+  [redirects.headers]
+    Access-Control-Allow-Origin = "*"
+
 [[redirects]]
   from = "/review/*"
   to = "https://ai-code-review-backend-4b80.onrender.com/review/:splat"
