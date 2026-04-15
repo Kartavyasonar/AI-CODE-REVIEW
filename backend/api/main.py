@@ -41,17 +41,16 @@ class NuclearCORS(BaseHTTPMiddleware):
 
 
 async def self_ping():
-    """Ping /health every 10 minutes to prevent Render free tier sleep."""
     import httpx
-    await asyncio.sleep(30)  # wait for startup
+    await asyncio.sleep(60)
     while True:
         try:
             async with httpx.AsyncClient() as client:
                 await client.get("http://localhost:10000/health", timeout=5)
-        except Exception:
-            pass
-        await asyncio.sleep(540)  # 9 minutes
-
+                print("Self-ping OK")
+        except Exception as e:
+            print(f"Self-ping failed: {e}")
+        await asyncio.sleep(540)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -114,10 +113,14 @@ def run_review_sync(job_id: str, repo_url: str):
         push(job_id, "error", message=f"Pipeline error: {str(e)}", detail=traceback.format_exc())
         jobs[job_id]["status"] = "failed"
 
+@app.get("/")
+async def root():
+    return {"status": "AI Code Review Agent is running"}
 
 @app.get("/health")
 async def health():
     return {"status": "ok", "active_jobs": len([j for j in jobs.values() if j["status"] == "running"])}
+
 
 
 @app.get("/ping")
