@@ -4,6 +4,7 @@ api/main.py — FastAPI backend with granular SSE progress events + Nuclear CORS
 import asyncio
 import json
 import os
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -20,7 +21,6 @@ jobs: dict = {}
 
 
 class NuclearCORS(BaseHTTPMiddleware):
-    """Injects CORS headers on EVERY response — OPTIONS, POST, GET, SSE."""
     async def dispatch(self, request: Request, call_next):
         if request.method == "OPTIONS":
             return JSONResponse(
@@ -46,7 +46,6 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="AI Code Review Agent v2", version="2.0.0", lifespan=lifespan)
-
 app.add_middleware(NuclearCORS)
 app.add_middleware(
     CORSMiddleware,
@@ -61,44 +60,48 @@ class ReviewRequest(BaseModel):
     repo_url: str
 
 
-def emit(event: str, data: dict) -> str:
-    return f"data: {json.dumps({'event': event, **data})}\n\n"
+def push(job_id: str, event: str, **kwargs):
+    """Thread-safe event push."""
+    jobs[job_id]["events"].append({"event": event, **kwargs})
 
 
 def run_review_sync(job_id: str, repo_url: str):
-    """Run the full pipeline synchronously in a background thread."""
+    """Runs in a plain daemon thread — writes events to jobs[job_id]['events']."""
     try:
-        jobs[job_id]["events"].append({"event": "status", "message": "Cloning repository...", "progress": 5})
+        push(job_id, "status", message="Cloning repository...", progress=5)
 
-        # Import here to avoid startup delays
         from backend.core.ingestion import ingest_repo
         from backend.core.pipeline import run_pipeline
 
-        jobs[job_id]["events"].append({"event": "status", "message": "Ingesting & embedding code...", "progress": 15})
+        push(job_id, "status", message="Ingesting & embedding code into ChromaDB...", progress=10)
 
         collection = ingest_repo(repo_url, job_id=job_id, events=jobs[job_id]["events"])
 
         if collection is None:
-            jobs[job_id]["events"].append({"event": "error", "message": "No Python/JS files found in repo."})
+            push(job_id, "error", message="No Python/JS files found in this repository.")
             jobs[job_id]["status"] = "failed"
             return
 
-        jobs[job_id]["events"].append({"event": "status", "message": "Running AI agents in parallel...", "progress": 40})
+        push(job_id, "status", message="Starting LangGraph multi-agent pipeline...", progress=40)
+        push(job_id, "agent_start", agent="bug", message="Bug agent starting...")
+        push(job_id, "agent_start", agent="security", message="Security agent starting...")
+        push(job_id, "agent_start", agent="quality", message="Quality agent starting...")
+        push(job_id, "agent_start", agent="perf", message="Performance agent starting...")
 
         result = run_pipeline(collection, repo_url, job_id=job_id, events=jobs[job_id]["events"])
 
         jobs[job_id]["result"] = result
         jobs[job_id]["status"] = "complete"
-        jobs[job_id]["events"].append({
-            "event": "complete",
-            "score": result.get("score", 0),
-            "total_findings": result.get("total_findings", 0),
-            "progress": 100
-        })
+        push(job_id, "complete",
+             score=result.get("score", 0),
+             total_findings=result.get("total_findings", 0),
+             progress=100)
 
     except Exception as e:
+        import traceback
+        err = traceback.format_exc()
+        push(job_id, "error", message=f"Pipeline error: {str(e)}", detail=err)
         jobs[job_id]["status"] = "failed"
-        jobs[job_id]["events"].append({"event": "error", "message": str(e)})
 
 
 @app.get("/health")
@@ -107,27 +110,23 @@ async def health():
 
 
 @app.post("/review")
-async def start_review(request: ReviewRequest):
-    """Start a code review job. Returns job_id immediately."""
+async def start_review(req: ReviewRequest):
     job_id = str(uuid.uuid4())[:8]
     jobs[job_id] = {
         "status": "running",
-        "repo_url": request.repo_url,
+        "repo_url": req.repo_url,
         "created_at": time.time(),
         "events": [],
         "result": None,
     }
-
-    # Run in background thread (not blocking the event loop)
-    loop = asyncio.get_event_loop()
-    loop.run_in_executor(None, run_review_sync, job_id, request.repo_url)
-
+    # Use plain threading — most reliable across all platforms
+    t = threading.Thread(target=run_review_sync, args=(job_id, req.repo_url), daemon=True)
+    t.start()
     return {"job_id": job_id, "status": "started"}
 
 
 @app.get("/review/{job_id}")
 async def get_review(job_id: str):
-    """Get the final result of a completed review."""
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
     job = jobs[job_id]
@@ -138,27 +137,32 @@ async def get_review(job_id: str):
 
 @app.get("/review/{job_id}/stream")
 async def stream_review(job_id: str):
-    """SSE stream — sends events as the pipeline progresses."""
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
 
     async def event_generator():
         sent = 0
-        while True:
-            job = jobs.get(job_id, {})
-            events = job.get("events", [])
+        timeout = 600  # 10 min max
+        started = time.time()
 
-            # Send any new events
+        while time.time() - started < timeout:
+            events = jobs.get(job_id, {}).get("events", [])
+
             while sent < len(events):
                 ev = events[sent]
-                yield emit(ev.get("event", "status"), ev)
+                yield f"data: {json.dumps(ev)}\n\n"
                 sent += 1
 
-            # If job is done, close stream
-            if job.get("status") in ("complete", "failed"):
+            if jobs.get(job_id, {}).get("status") in ("complete", "failed"):
+                # Drain any final events
+                events = jobs.get(job_id, {}).get("events", [])
+                while sent < len(events):
+                    ev = events[sent]
+                    yield f"data: {json.dumps(ev)}\n\n"
+                    sent += 1
                 break
 
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.3)
 
     return StreamingResponse(
         event_generator(),
@@ -167,5 +171,6 @@ async def stream_review(job_id: str):
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
             "Access-Control-Allow-Origin": "*",
+            "Connection": "keep-alive",
         },
     )
