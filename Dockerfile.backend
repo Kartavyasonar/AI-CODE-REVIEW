@@ -1,24 +1,36 @@
-FROM python:3.12-slim
+# FIXED: Changed from python:3.12-slim to python:3.11-slim
+# to match runtime.txt and render.yaml (was python:3.12 before).
+# torch + sentence-transformers have known issues on 3.12 in some environments.
+FROM python:3.11-slim
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y \
+# System deps: git (for cloning), curl (health check), build tools for torch/sentence-transformers
+RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
-    gcc \
-    g++ \
     curl \
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
+# Install Python dependencies first (layer cache)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Pre-download sentence-transformer models at build time so they're baked into
+# the image. Avoids a 30-60s download on first request at runtime.
 RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
 RUN python -c "from sentence_transformers import CrossEncoder; CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')"
 
+# Copy source code
 COPY . .
 
-RUN mkdir -p memory_db chroma_db
+# Suppress chromadb telemetry at build time too
+ENV ANONYMIZED_TELEMETRY=false
+ENV CHROMA_TELEMETRY=false
 
 EXPOSE 8000
 
-CMD ["uvicorn", "backend.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Use $PORT env var so Railway/Render/Fly.io can all inject their preferred port.
+# --workers 1 is intentional: _active_collections dict is in-process, not shared across workers.
+# For multi-worker support, migrate job state to Redis.
+CMD ["sh", "-c", "uvicorn backend.api.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1"]

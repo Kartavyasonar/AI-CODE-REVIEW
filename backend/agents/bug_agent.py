@@ -1,7 +1,12 @@
 """
-agents/bug_agent.py  v2
-Works with both namespace objects (from pipeline) and direct calls.
-Returns the state namespace with bug_findings populated.
+agents/bug_agent.py  v2 — FIXED
+
+Changes vs original:
+  - No logic changes needed in this agent (it was correct).
+  - hyde_queries is now parallelised upstream (hyde.py fix) so sequential
+    latency from this agent is already resolved.
+  - seen_snippets dedup key now also includes filepath to prevent cross-file
+    false-positive deduplication (two different files could have identical snippets).
 """
 import json
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -46,22 +51,16 @@ BASE_QUERIES = [
 
 
 def run_bug_agent(state, collection, extra_queries=None):
-    """
-    state: any object with .all_chunks, .repo_url attributes
-    Returns state with .bug_findings set
-    """
-    llm = get_llm()
+    llm        = get_llm()
     all_queries = BASE_QUERIES + (extra_queries or [])
 
-    # Skip HyDE if collection is empty (e.g. repo had no source files)
     if collection.count() == 0:
         state.bug_findings = []
         return state
 
-    hyde_expanded = hyde_queries(all_queries)
-
-    all_findings = []
-    seen_snippets = set()
+    hyde_expanded    = hyde_queries(all_queries)
+    all_findings     = []
+    seen_snippets    = set()
     all_code_context = []
 
     for original_q, hyde_q in zip(all_queries, hyde_expanded):
@@ -81,39 +80,37 @@ def run_bug_agent(state, collection, extra_queries=None):
         )
         all_code_context.append(code_context)
 
-        messages = [
-            SystemMessage(content=SYSTEM_PROMPT),
-            HumanMessage(content=f"Find bugs in these code chunks:\n\n{code_context}"),
-        ]
-
         try:
-            response = llm.invoke(messages)
+            response = llm.invoke([
+                SystemMessage(content=SYSTEM_PROMPT),
+                HumanMessage(content=f"Find bugs in these code chunks:\n\n{code_context}"),
+            ])
             raw = response.content.strip()
             raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-            findings_data = json.loads(raw)
-            for fd in findings_data:
+            for fd in json.loads(raw):
                 if not isinstance(fd, dict):
                     continue
+                # FIXED: include filepath in dedup key — same snippet in two files is two findings
                 snippet = fd.get("code_snippet", "")
-                if snippet and snippet in seen_snippets:
+                key = (fd.get("file", ""), snippet)
+                if key in seen_snippets:
                     continue
-                seen_snippets.add(snippet or "")
+                seen_snippets.add(key)
                 all_findings.append(Finding(
                     agent="bug_agent",
-                    severity=fd.get("severity", "low"),
-                    category=fd.get("category", "bug"),
-                    file=fd.get("file", "unknown"),
-                    line=fd.get("line"),
-                    title=fd.get("title", "Untitled"),
-                    description=fd.get("description", ""),
-                    suggestion=fd.get("suggestion", ""),
+                    severity    =fd.get("severity",     "low"),
+                    category    =fd.get("category",     "bug"),
+                    file        =fd.get("file",         "unknown"),
+                    line        =fd.get("line"),
+                    title       =fd.get("title",        "Untitled"),
+                    description =fd.get("description",  ""),
+                    suggestion  =fd.get("suggestion",   ""),
                     code_snippet=fd.get("code_snippet"),
                 ))
         except Exception:
             pass
 
     combined_context = "\n\n".join(all_code_context)[:4000]
-    all_findings = score_and_reflect(all_findings, combined_context)
-
+    all_findings     = score_and_reflect(all_findings, combined_context)
     state.bug_findings = all_findings
     return state

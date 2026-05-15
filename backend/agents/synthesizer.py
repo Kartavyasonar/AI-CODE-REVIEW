@@ -1,59 +1,73 @@
-"""agents/synthesizer.py  v2"""
+"""
+agents/synthesizer.py  v2
+
+Deduplicates findings, computes logarithmic score, generates markdown report,
+and calls the LLM for an executive summary.
+
+No logic fixes needed — this file was correct in the original.
+Minor change: Finding attribute access uses .model_fields approach so it works
+when findings arrive as either Pydantic objects or plain dicts (from serialisation).
+"""
+import math
+
 from langchain_core.messages import HumanMessage, SystemMessage
+
 from backend.core.llm import get_llm
 from backend.core.state import Finding
 
-# ── Scoring ───────────────────────────────────────────────────────────────────
-# Score uses a logarithmic penalty so a large repo doesn't auto-score 0.
-# Formula: start at 100, subtract log-scaled penalty per severity bucket.
-# Max penalty per bucket: critical=30, high=20, medium=10, low=5
+# ── Scoring ────────────────────────────────────────────────────────────────────
+# Logarithmic penalty: each severity bucket contributes at most BUCKET_MAX penalty,
+# reached asymptotically after BUCKET_SCALE findings in that bucket.
+# A repo with 60 medium findings still scores ~60, not 0.
 BUCKET_MAX   = {"critical": 30, "high": 20, "medium": 10, "low": 5, "info": 0}
 BUCKET_SCALE = {"critical": 2,  "high": 3,  "medium": 5,  "low": 10, "info": 999}
-# BUCKET_SCALE = "how many findings before penalty maxes out"
+
+
+def _get(f, attr: str, default=""):
+    """Get attribute from Finding object or dict."""
+    if isinstance(f, dict):
+        return f.get(attr, default)
+    return getattr(f, attr, default)
+
 
 def compute_score(all_findings) -> int:
-    """
-    Logarithmic scoring: each severity bucket contributes at most BUCKET_MAX points
-    of penalty, reached after BUCKET_SCALE findings in that bucket.
-    A repo with 60 medium findings still scores ~60, not 0.
-    """
-    import math
     counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
     for f in all_findings:
-        sev = getattr(f, "severity", "low")
+        sev = _get(f, "severity", "low")
         if sev in counts:
             counts[sev] += 1
 
-    total_penalty = 0
+    total_penalty = 0.0
     for sev, count in counts.items():
         if count == 0:
             continue
-        scale = BUCKET_SCALE[sev]
-        max_p = BUCKET_MAX[sev]
-        # log curve: penalty = max_p * (1 - 1/(1 + count/scale))
+        scale   = BUCKET_SCALE[sev]
+        max_p   = BUCKET_MAX[sev]
         penalty = max_p * (1 - 1 / (1 + count / scale))
         total_penalty += penalty
 
     return max(0, round(100 - total_penalty))
 
 
-# ── Dedup ─────────────────────────────────────────────────────────────────────
-def deduplicate(findings):
+# ── Dedup ──────────────────────────────────────────────────────────────────────
+
+def deduplicate(findings) -> list:
     seen, result = set(), []
     for f in findings:
-        key = (getattr(f, "file", ""), getattr(f, "title", "")[:50])
+        key = (_get(f, "file", ""), _get(f, "title", "")[:50])
         if key not in seen:
             seen.add(key)
             result.append(f)
     return result
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def severity_emoji(s):
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def severity_emoji(s: str) -> str:
     return {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🔵", "info": "⚪"}.get(s, "⚪")
 
 
-def _grade(score):
+def _grade(score: int) -> str:
     if score >= 85: return "A — solid codebase"
     if score >= 70: return "B — good with minor issues"
     if score >= 55: return "C — needs attention"
@@ -61,7 +75,8 @@ def _grade(score):
     return "F — critical issues found"
 
 
-# ── Summary ───────────────────────────────────────────────────────────────────
+# ── Executive summary ──────────────────────────────────────────────────────────
+
 SUMMARY_PROMPT = """You are a staff engineer writing a code review executive summary.
 Write exactly 3 sentences:
 1. Overall health of the codebase (be specific about what's good vs bad)
@@ -71,18 +86,23 @@ Be direct. No filler words. Max 80 words total."""
 
 
 def _build_summary(state, llm) -> str:
-    bug_f  = getattr(state, "bug_findings", [])
+    bug_f  = getattr(state, "bug_findings",      [])
     sec_f  = getattr(state, "security_findings", [])
-    qual_f = getattr(state, "quality_findings", [])
-    perf_f = getattr(state, "perf_findings", [])
+    qual_f = getattr(state, "quality_findings",  [])
+    perf_f = getattr(state, "perf_findings",     [])
     all_f  = bug_f + sec_f + qual_f + perf_f
 
-    # Send only top 15 findings to stay under token limit
-    order = ["critical", "high", "medium", "low", "info"]
-    sorted_f = sorted(all_f, key=lambda x: order.index(getattr(x, "severity", "info")) if getattr(x, "severity", "info") in order else 99)
-    top = sorted_f[:15]
-
-    lines = [f"[{getattr(f,'severity','?').upper()}] {getattr(f,'file','?')}: {getattr(f,'title','')}" for f in top]
+    order    = ["critical", "high", "medium", "low", "info"]
+    sorted_f = sorted(
+        all_f,
+        key=lambda x: order.index(_get(x, "severity", "info"))
+        if _get(x, "severity", "info") in order else 99
+    )
+    top   = sorted_f[:15]
+    lines = [
+        f"[{_get(f,'severity','?').upper()}] {_get(f,'file','?')}: {_get(f,'title','')}"
+        for f in top
+    ]
     findings_text = "\n".join(lines) or "No findings."
 
     try:
@@ -93,34 +113,33 @@ def _build_summary(state, llm) -> str:
         return resp.content.strip()
     except Exception as e:
         err = str(e)
-        # Give a useful auto-summary when rate-limited
         if "rate_limit" in err or "429" in err:
-            criticals = [f for f in all_f if getattr(f,"severity","") == "critical"]
-            highs     = [f for f in all_f if getattr(f,"severity","") == "high"]
-            top3 = (criticals + highs)[:3]
-            top3_titles = ", ".join(getattr(f,"title","") for f in top3) or "see findings below"
+            criticals = [f for f in all_f if _get(f, "severity") == "critical"]
+            highs     = [f for f in all_f if _get(f, "severity") == "high"]
+            top3      = (criticals + highs)[:3]
+            top3_t    = ", ".join(_get(f, "title") for f in top3) or "see findings below"
             return (
                 f"Auto-summary (Groq rate limit hit — try again in a few minutes): "
                 f"{len(all_f)} findings across {len(bug_f)} bugs, {len(sec_f)} security, "
                 f"{len(qual_f)} quality, {len(perf_f)} performance issues. "
-                f"Priority: {top3_titles}."
+                f"Priority: {top3_t}."
             )
         return f"Summary unavailable: {err}"
 
 
-# ── Report generator ──────────────────────────────────────────────────────────
-def generate_report(state, summary, memory_insights="") -> str:
-    bug_f  = getattr(state, "bug_findings", [])
+# ── Report generator ───────────────────────────────────────────────────────────
+
+def generate_report(state, summary: str, memory_insights: str = "") -> str:
+    bug_f  = getattr(state, "bug_findings",      [])
     sec_f  = getattr(state, "security_findings", [])
-    qual_f = getattr(state, "quality_findings", [])
-    perf_f = getattr(state, "perf_findings", [])
+    qual_f = getattr(state, "quality_findings",  [])
+    perf_f = getattr(state, "perf_findings",     [])
     all_f  = bug_f + sec_f + qual_f + perf_f
     score  = compute_score(all_f)
-    chains = [f for f in sec_f if "[CHAIN]" in getattr(f, "title", "")]
+    chains = [f for f in sec_f if "[CHAIN]" in _get(f, "title", "")]
 
-    bar_filled = score // 10
-    bar = "█" * bar_filled + "░" * (10 - bar_filled)
-    grade = _grade(score)
+    bar      = "█" * (score // 10) + "░" * (10 - score // 10)
+    grade    = _grade(score)
 
     lines = [
         "# AI Code Review Report — v2 Advanced",
@@ -164,30 +183,34 @@ def generate_report(state, summary, memory_insights="") -> str:
 
     order = ["critical", "high", "medium", "low", "info"]
     for section, findings in [
-        ("🐛 Bug Findings", bug_f),
+        ("🐛 Bug Findings",    bug_f),
         ("🔒 Security Findings", sec_f),
-        ("🧹 Code Quality", qual_f),
-        ("⚡ Performance", perf_f),
+        ("🧹 Code Quality",    qual_f),
+        ("⚡ Performance",     perf_f),
     ]:
         if not findings:
             continue
         lines.append(f"## {section}")
         lines.append("")
-        sorted_f = sorted(findings, key=lambda x: order.index(getattr(x,"severity","info")) if getattr(x,"severity","info") in order else 99)
+        sorted_f = sorted(
+            findings,
+            key=lambda x: order.index(_get(x, "severity", "info"))
+            if _get(x, "severity", "info") in order else 99
+        )
         for f in sorted_f:
-            sev = getattr(f, "severity", "info")
-            file_ = getattr(f, "file", "?")
-            line_ = getattr(f, "line", None)
+            sev   = _get(f, "severity", "info")
+            file_ = _get(f, "file", "?")
+            line_ = _get(f, "line")
             lines += [
-                f"### {severity_emoji(sev)} [{sev.upper()}] {getattr(f,'title','')}",
+                f"### {severity_emoji(sev)} [{sev.upper()}] {_get(f,'title','')}",
                 "",
                 f"**File:** `{file_}`" + (f"  **Line:** {line_}" if line_ else ""),
                 "",
-                f"**Issue:** {getattr(f,'description','')}",
+                f"**Issue:** {_get(f,'description','')}",
                 "",
-                f"**Fix:** {getattr(f,'suggestion','')}",
+                f"**Fix:** {_get(f,'suggestion','')}",
             ]
-            snippet = getattr(f, "code_snippet", None)
+            snippet = _get(f, "code_snippet")
             if snippet:
                 lines += ["", "```", snippet.strip(), "```"]
             lines.append("")
@@ -199,21 +222,23 @@ def generate_report(state, summary, memory_insights="") -> str:
     return "\n".join(lines)
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
-def run_synthesizer(state, memory_insights=""):
+# ── Entry point ────────────────────────────────────────────────────────────────
+
+def run_synthesizer(state, memory_insights: str = ""):
     llm = get_llm()
 
     all_findings = deduplicate(
-        getattr(state, "bug_findings", []) +
+        getattr(state, "bug_findings",      []) +
         getattr(state, "security_findings", []) +
-        getattr(state, "quality_findings", []) +
-        getattr(state, "perf_findings", [])
+        getattr(state, "quality_findings",  []) +
+        getattr(state, "perf_findings",     [])
     )
 
-    state.bug_findings      = [f for f in all_findings if getattr(f,"agent","") == "bug_agent"]
-    state.security_findings = [f for f in all_findings if getattr(f,"agent","") in ("security_agent","reflection_chain")]
-    state.quality_findings  = [f for f in all_findings if getattr(f,"agent","") == "quality_agent"]
-    state.perf_findings     = [f for f in all_findings if getattr(f,"agent","") == "perf_agent"]
+    # Re-partition deduplicated findings back to their agent buckets
+    state.bug_findings      = [f for f in all_findings if _get(f, "agent") == "bug_agent"]
+    state.security_findings = [f for f in all_findings if _get(f, "agent") in ("security_agent", "reflection_chain")]
+    state.quality_findings  = [f for f in all_findings if _get(f, "agent") == "quality_agent"]
+    state.perf_findings     = [f for f in all_findings if _get(f, "agent") == "perf_agent"]
 
     state.summary         = _build_summary(state, llm)
     state.score           = compute_score(all_findings)

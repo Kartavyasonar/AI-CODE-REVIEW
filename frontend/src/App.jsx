@@ -1,6 +1,9 @@
 import { useState, useEffect, useRef } from "react";
 
-const API = "https://ai-code-review-backend-4b80.onrender.com";
+// FIXED: API URL from environment variable instead of hardcoded string.
+// Set VITE_API_URL in your .env.local or Vercel environment variables.
+// Falls back to localhost for local development.
+const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
 const T = {
   bg:"#0a0a0f", surface:"#111118", card:"#16161f", border:"#1e1e2e",
@@ -145,22 +148,22 @@ function FindingCard({ f }) {
   );
 }
 
-// ── Main ───────────────────────────────────────────────────────────────────
+// ── Main ─────────────────────────────────────────────────────────────────────
 export default function App() {
-  const [url, setUrl]         = useState("");
-  const [steps, setSteps]     = useState([]);
-  const [progress, setProgress] = useState(0);
-  const [curStep, setCurStep] = useState("");
+  const [url, setUrl]             = useState("");
+  const [steps, setSteps]         = useState([]);
+  const [progress, setProgress]   = useState(0);
+  const [curStep, setCurStep]     = useState("");
   const [curDetail, setCurDetail] = useState("");
-  const [result, setResult]   = useState(null);
-  const [error, setError]     = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [tab, setTab]         = useState("all");
+  const [result, setResult]       = useState(null);
+  const [error, setError]         = useState(null);
+  const [loading, setLoading]     = useState(false);
+  const [tab, setTab]             = useState("all");
   const [startTime, setStartTime] = useState(null);
-  const [elapsed, setElapsed] = useState(0);
-  const [fileCt, setFileCt]   = useState(0);
-  const [chunkCt, setChunkCt] = useState(0);
-  const esRef = useRef(null);
+  const [elapsed, setElapsed]     = useState(0);
+  const [fileCt, setFileCt]       = useState(0);
+  const [chunkCt, setChunkCt]     = useState(0);
+  const esRef    = useRef(null);
   const timerRef = useRef(null);
 
   useEffect(() => {
@@ -172,45 +175,80 @@ export default function App() {
     return () => clearInterval(timerRef.current);
   }, [loading, startTime]);
 
-  // POST with retry — handles Render cold start (backend sleeping)
-  async function postWithRetry(url_path, body, maxAttempts=5) {
+  // Cleanup SSE on unmount
+  useEffect(() => {
+    return () => {
+      if (esRef.current) esRef.current.close();
+    };
+  }, []);
+
+  // POST with exponential-backoff retry to survive Render cold starts
+  async function postWithRetry(urlPath, body, maxAttempts=5) {
     for (let i=0; i<maxAttempts; i++) {
       try {
-        const res = await fetch(`${API}${url_path}`, {
+        const res = await fetch(`${API}${urlPath}`, {
           method:"POST",
           headers:{"Content-Type":"application/json"},
           body: JSON.stringify(body),
         });
         if (res.ok) return res.json();
+        if (res.status === 429) {
+          const msg = await res.json().catch(()=>({}));
+          throw new Error(msg.detail || "Too many concurrent reviews — try again shortly.");
+        }
+        if (res.status === 422) {
+          const msg = await res.json().catch(()=>({}));
+          const detail = msg.detail?.[0]?.msg || msg.detail || "Invalid input";
+          throw new Error(`Validation error: ${detail}`);
+        }
         if (res.status === 404 || res.status === 503) {
-          // Backend waking up — wait and retry
-          await new Promise(r => setTimeout(r, 3000));
+          await new Promise(r => setTimeout(r, 3000 * (i+1)));
           continue;
         }
         throw new Error(`HTTP ${res.status}`);
       } catch(e) {
         if (i === maxAttempts-1) throw e;
+        if (e.message.startsWith("Validation") || e.message.startsWith("Too many")) throw e;
         await new Promise(r => setTimeout(r, 3000));
       }
     }
-    throw new Error("Backend did not respond after 5 attempts");
+    throw new Error("Backend did not respond after 5 attempts.");
   }
 
   const startReview = async () => {
     if (!url.trim()) return;
+
+    // Basic client-side URL validation before hitting the server
+    try {
+      const parsed = new URL(url.trim());
+      if (!["http:", "https:"].includes(parsed.protocol)) {
+        setError("Only HTTP/HTTPS URLs are supported.");
+        return;
+      }
+    } catch {
+      setError("Please enter a valid URL.");
+      return;
+    }
+
     setError(null); setResult(null); setSteps([]);
-    setProgress(0); setCurStep("waking"); setCurDetail("Waking backend — free tier may take 30s...");
-    setLoading(true); setTab("all"); setFileCt(0); setChunkCt(0);
+    setProgress(0); setCurStep("waking");
+    setCurDetail("Waking backend — free tier may take 30s...");
+    setLoading(true); setTab("all");
+    setFileCt(0); setChunkCt(0);
     setStartTime(Date.now());
 
-    // Show waking step in log immediately
-    const wakeStep = { step:"waking", detail:"Waking Render backend (free tier cold start ~30s)...", progress:2, ts:Date.now()/1000 };
+    const wakeStep = {
+      step:"waking",
+      detail:"Waking backend (free tier cold start ~30s)...",
+      progress:2,
+      ts: Date.now()/1000,
+    };
     setSteps([wakeStep]);
 
     try {
       const data = await postWithRetry("/review", { repo_url: url.trim() });
 
-      if (!data?.job_id) throw new Error("Backend returned no job_id — check Render logs");
+      if (!data?.job_id) throw new Error("Backend returned no job_id — check server logs.");
 
       setCurStep("cloning");
       setCurDetail("Backend alive! Starting review...");
@@ -220,52 +258,98 @@ export default function App() {
       esRef.current = es;
 
       es.onmessage = (e) => {
-        const ev = JSON.parse(e.data);
-        if (ev.type === "step") {
-          setSteps(prev => [...prev, ev]);
-          setProgress(ev.progress||0);
-          setCurStep(ev.step||"");
-          setCurDetail(ev.detail||"");
-        } else if (ev.type === "done") {
-          setProgress(100); setCurStep("done");
-          setFileCt(ev.file_count||0); setChunkCt(ev.chunk_count||0);
-          fetch(`${API}/review/${data.job_id}`)
-            .then(r=>r.json())
-            .then(d=>{ setResult(d); setLoading(false); });
-          es.close();
-        } else if (ev.type === "error") {
-          setError(ev.error||"Unknown error");
-          setLoading(false); es.close();
+        try {
+          const ev = JSON.parse(e.data);
+
+          // FIXED: backend now pushes {event: "status"|"complete"|"error", ...}
+          // Frontend previously checked ev.type but backend emitted ev.event.
+          // Support both for backwards compatibility.
+          const evType = ev.type || ev.event || "";
+
+          if (evType === "step" || evType === "status") {
+            setSteps(prev => [...prev, { ...ev, step: ev.step || "status" }]);
+            if (ev.progress != null) setProgress(ev.progress);
+            if (ev.step)   setCurStep(ev.step);
+            if (ev.detail) setCurDetail(ev.detail);
+            if (ev.message && !ev.detail) setCurDetail(ev.message);
+          } else if (evType === "complete") {
+            setProgress(100);
+            setCurStep("done");
+            setFileCt(ev.file_count   || 0);
+            setChunkCt(ev.chunk_count || 0);
+            // Fetch full result from REST endpoint
+            fetch(`${API}/review/${data.job_id}`)
+              .then(r => r.json())
+              .then(d => {
+                // API wraps result under d.result
+                setResult(d.result || d);
+                setLoading(false);
+              })
+              .catch(err => {
+                setError(`Failed to fetch results: ${err.message}`);
+                setLoading(false);
+              });
+            es.close();
+          } else if (evType === "error") {
+            setError(ev.error || ev.message || "Unknown pipeline error");
+            setLoading(false);
+            es.close();
+          }
+        } catch {
+          // Malformed SSE event — ignore (keep-alive comments land here too)
         }
       };
-      es.onerror = () => { es.close(); };
+
+      es.onerror = () => {
+        // Only surface as error if we're still loading (not after successful close)
+        if (loading) {
+          setError("Connection to backend lost. The review may still be running — refresh to check.");
+        }
+        es.close();
+        setLoading(false);
+      };
+
     } catch(e) {
-      setError(`${e.message}. Make sure the Render backend is deployed and running.`);
+      setError(`${e.message}`);
       setLoading(false);
     }
   };
 
+  // ── Derived state ────────────────────────────────────────────────────────
+
   const allFindings = result ? [
-    ...(result.bug_findings||[]), ...(result.security_findings||[]),
-    ...(result.quality_findings||[]), ...(result.perf_findings||[]),
+    ...(result.bug_findings      || []),
+    ...(result.security_findings || []),
+    ...(result.quality_findings  || []),
+    ...(result.perf_findings     || []),
   ] : [];
 
-  const filtered = tab==="all" ? allFindings
-    : tab==="bug"      ? (result?.bug_findings||[])
-    : tab==="security" ? (result?.security_findings||[])
-    : tab==="quality"  ? (result?.quality_findings||[])
-    : (result?.perf_findings||[]);
+  const filtered =
+    tab === "all"      ? allFindings
+    : tab === "bug"      ? (result?.bug_findings      || [])
+    : tab === "security" ? (result?.security_findings || [])
+    : tab === "quality"  ? (result?.quality_findings  || [])
+    : (result?.perf_findings || []);
 
-  const chains = allFindings.filter(f=>f.title?.includes("[CHAIN]"));
-  const agentActive = loading && (curStep.startsWith("agent_")||["agents","agents_running","chains","synthesizing"].includes(curStep));
+  const chains = allFindings.filter(f => f.title?.includes("[CHAIN]"));
 
+  const agentActive = loading && (
+    curStep.startsWith("agent_") ||
+    ["agents", "agents_running", "chains", "synthesizing"].includes(curStep)
+  );
+
+  // FIXED: use actual array lengths (computed above) for tab counts
+  // Original used result.findings.bugs etc. which only existed if the backend
+  // sent a findings summary dict — now we derive counts from the arrays directly.
   const TABS = [
-    { id:"all",      label:"All",        count:allFindings.length,              color:T.purpleL },
-    { id:"bug",      label:"🐛 Bugs",    count:result?.findings?.bugs||0,        color:T.red },
-    { id:"security", label:"🔒 Security",count:result?.findings?.security||0,    color:T.amber },
-    { id:"quality",  label:"🧹 Quality", count:result?.findings?.quality||0,     color:T.blue },
-    { id:"perf",     label:"⚡ Perf",    count:result?.findings?.performance||0, color:T.green },
+    { id:"all",      label:"All",         count: allFindings.length,                   color:T.purpleL },
+    { id:"bug",      label:"🐛 Bugs",     count: result?.bug_findings?.length      || 0, color:T.red },
+    { id:"security", label:"🔒 Security", count: result?.security_findings?.length  || 0, color:T.amber },
+    { id:"quality",  label:"🧹 Quality",  count: result?.quality_findings?.length   || 0, color:T.blue },
+    { id:"perf",     label:"⚡ Perf",     count: result?.perf_findings?.length      || 0, color:T.green },
   ];
+
+  // ── Render ───────────────────────────────────────────────────────────────
 
   return (
     <div style={{minHeight:"100vh",background:T.bg,color:T.text,
@@ -333,7 +417,7 @@ export default function App() {
             ))}
           </div>
           <div style={{marginTop:10,fontSize:11,color:T.textDim}}>
-            ⚠ Free tier backend sleeps after 15min inactivity — first request takes ~30s to wake
+            ⚠ Free tier backend may take ~30s to wake on first request
           </div>
         </div>
 
@@ -394,7 +478,7 @@ export default function App() {
           <div style={{animation:"fadeIn 0.5s ease"}}>
             <div style={{display:"grid",gridTemplateColumns:"auto 1fr",gap:20,marginBottom:16,
               background:T.card,borderRadius:16,border:`1px solid ${T.border}`,padding:24}}>
-              <ScoreRing score={result.score} size={150}/>
+              <ScoreRing score={result.score||0} size={150}/>
               <div>
                 <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:10,flexWrap:"wrap"}}>
                   <span style={{fontWeight:800,fontSize:17}}>Review Complete</span>
@@ -414,10 +498,10 @@ export default function App() {
                 <p style={{fontSize:13,color:T.textSub,lineHeight:1.75,margin:"0 0 14px"}}>{result.summary}</p>
                 <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
                   {[
-                    {label:"Bugs",     val:result.findings?.bugs||0,        color:T.red},
-                    {label:"Security", val:result.findings?.security||0,    color:T.amber},
-                    {label:"Quality",  val:result.findings?.quality||0,     color:T.blue},
-                    {label:"Perf",     val:result.findings?.performance||0, color:T.green},
+                    {label:"Bugs",     val:result.bug_findings?.length      || 0, color:T.red},
+                    {label:"Security", val:result.security_findings?.length  || 0, color:T.amber},
+                    {label:"Quality",  val:result.quality_findings?.length   || 0, color:T.blue},
+                    {label:"Perf",     val:result.perf_findings?.length      || 0, color:T.green},
                   ].map(s=>(
                     <div key={s.label} style={{padding:"8px 14px",background:"#0a0a0f",
                       borderRadius:10,border:`1px solid ${T.border}`,textAlign:"center",minWidth:60}}>
