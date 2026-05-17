@@ -21,7 +21,6 @@ const SEV = {
 };
 
 const STEPS = {
-  waking:        { label:"Waking backend...",         icon:"⏳", color:"#8b8aaa" },
   cloning:       { label:"Cloning repository",        icon:"⬇", color:"#3b82f6" },
   walking:       { label:"Walking file tree",         icon:"🌲", color:"#3b82f6" },
   chunking:      { label:"AST chunking code",         icon:"✂", color:"#7c3aed" },
@@ -182,8 +181,8 @@ export default function App() {
     };
   }, []);
 
-  // POST with exponential-backoff retry to survive Render cold starts
-  async function postWithRetry(urlPath, body, maxAttempts=5) {
+  // POST with retry
+  async function postWithRetry(urlPath, body, maxAttempts=2) {
     for (let i=0; i<maxAttempts; i++) {
       try {
         const res = await fetch(`${API}${urlPath}`, {
@@ -212,7 +211,7 @@ export default function App() {
         await new Promise(r => setTimeout(r, 3000));
       }
     }
-    throw new Error("Backend did not respond after 5 attempts.");
+    throw new Error("Backend did not respond after retries.");
   }
 
   const startReview = async () => {
@@ -231,19 +230,11 @@ export default function App() {
     }
 
     setError(null); setResult(null); setSteps([]);
-    setProgress(0); setCurStep("waking");
-    setCurDetail("Waking backend — free tier may take 30s...");
+    setProgress(0); setCurStep("cloning");
+    setCurDetail("Initializing pipeline...");
     setLoading(true); setTab("all");
     setFileCt(0); setChunkCt(0);
     setStartTime(Date.now());
-
-    const wakeStep = {
-      step:"waking",
-      detail:"Waking backend (free tier cold start ~30s)...",
-      progress:2,
-      ts: Date.now()/1000,
-    };
-    setSteps([wakeStep]);
 
     try {
       const data = await postWithRetry("/review", { repo_url: url.trim() });
@@ -251,7 +242,7 @@ export default function App() {
       if (!data?.job_id) throw new Error("Backend returned no job_id — check server logs.");
 
       setCurStep("cloning");
-      setCurDetail("Backend alive! Starting review...");
+      setCurDetail("Starting review...");
 
       if (esRef.current) esRef.current.close();
       const es = new EventSource(`${API}/review/${data.job_id}/stream`);
@@ -331,9 +322,6 @@ export default function App() {
     ["agents", "agents_running", "chains", "synthesizing"].includes(curStep)
   );
 
-  // FIXED: use actual array lengths (computed above) for tab counts
-  // Original used result.findings.bugs etc. which only existed if the backend
-  // sent a findings summary dict — now we derive counts from the arrays directly.
   const TABS = [
     { id:"all",      label:"All",         count: allFindings.length,                   color:T.purpleL },
     { id:"bug",      label:"🐛 Bugs",     count: result?.bug_findings?.length      || 0, color:T.red },
@@ -408,9 +396,6 @@ export default function App() {
                 {r}
               </button>
             ))}
-          </div>
-          <div style={{marginTop:10,fontSize:11,color:T.textDim}}>
-            ⚠ Free tier backend may take ~30s to wake on first request
           </div>
         </div>
 
