@@ -1,14 +1,18 @@
 # AI Code Review Agent
 
-> Multi-agent AI system that reviews GitHub repositories for bugs, security vulnerabilities, code quality issues, and performance bottlenecks — powered by LangGraph, ChromaDB, and Groq LLaMA 3.3 70B.
+Multi-agent AI system that reviews GitHub repositories for bugs, security vulnerabilities, code quality issues, and performance bottlenecks — powered by LangGraph, ChromaDB, and Groq LLaMA 3.3 70B.
 
-![Python](https://img.shields.io/badge/Python-3.12-blue)
-![LangGraph](https://img.shields.io/badge/LangGraph-0.2-purple)
-![ChromaDB](https://img.shields.io/badge/ChromaDB-0.5-orange)
-![FastAPI](https://img.shields.io/badge/FastAPI-0.115-green)
-![Groq](https://img.shields.io/badge/Groq-LLaMA3.3%2070B-red)
+![Python](https://img.shields.io/badge/Python-3.11-blue) ![LangGraph](https://img.shields.io/badge/LangGraph-0.5.4-purple) ![ChromaDB](https://img.shields.io/badge/ChromaDB-latest-green) ![FastAPI](https://img.shields.io/badge/FastAPI-latest-teal) ![Groq](https://img.shields.io/badge/Groq-LLaMA3.3_70B-orange)
 
-## Demo
+## Live Demo
+
+🌐 **Frontend:** [ai-code-review-xi-one.vercel.app](https://ai-code-review-xi-one.vercel.app)  
+⚙️ **Backend:** Self-hosted on Oracle Cloud (Always Free) via Caddy HTTPS reverse proxy  
+📡 **API:** `https://ai-code-review.duckdns.org`
+
+---
+
+## Demo Output
 
 ```
 $ python cli.py https://github.com/username/my-project
@@ -21,8 +25,7 @@ $ python cli.py https://github.com/username/my-project
 ⚡ Performance agent     ████████████ done  (8 findings)
 📝 Synthesizing report   ████████████ done
 
-Overall Score: 61/100
-████████░░ 61/100
+Overall Score: 61/100  ████████░░
 
 ## Executive Summary
 The codebase has solid architecture but critical SQL injection vulnerabilities
@@ -30,6 +33,8 @@ in api/routes.py that must be fixed immediately. Authentication is well-structur
 but two hardcoded API keys were found. Start by addressing the injection flaws
 and rotating the exposed credentials.
 ```
+
+---
 
 ## Architecture
 
@@ -60,32 +65,38 @@ GitHub URL
     └────────────────────┘
 ```
 
+---
+
 ## Tech Stack
 
 | Layer | Technology | Purpose |
-|---|---|---|
+|-------|-----------|---------|
 | LLM | Groq LLaMA 3.3 70B | All agent reasoning |
-| Orchestration | LangGraph | Multi-agent state machine |
+| Orchestration | LangGraph 0.5.4 | Multi-agent state machine |
 | RAG | ChromaDB + sentence-transformers | Code semantic search |
 | Code parsing | Python AST + radon | Chunk at function boundaries, complexity |
 | Static analysis | Custom regex + bandit patterns | Secret detection |
-| Backend | FastAPI | REST API + SSE streaming |
+| Backend | FastAPI + Uvicorn | REST API + SSE streaming |
 | Frontend | React + Vite | Dashboard UI |
-| Deploy | Docker + Render | Production ready |
+| Frontend deploy | Vercel | Auto-deploy from GitHub main |
+| Backend deploy | Oracle Cloud VM (Always Free) | Self-hosted, always-on |
+| HTTPS | Caddy + DuckDNS | Automatic TLS certificates |
+
+---
 
 ## Quick Start
 
 ### 1. Clone and setup
 
 ```bash
-git clone https://github.com/yourusername/ai-code-review-agent
-cd ai-code-review-agent
+git clone https://github.com/Kartavyasonar/AI-CODE-REVIEW
+cd AI-CODE-REVIEW
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
 ```
 
-### 2. Add your Groq API key (free at console.groq.com)
+### 2. Add your Groq API key (free at [console.groq.com](https://console.groq.com))
 
 ```bash
 # Edit .env
@@ -116,6 +127,33 @@ docker-compose up --build
 # API docs: http://localhost:8000/docs
 ```
 
+---
+
+## Self-Hosted Deployment (Oracle Cloud)
+
+The production backend runs on an **Oracle Cloud Always Free** VM with the following setup:
+
+- **VM:** VM.Standard.E2.1.Micro (1 OCPU, 1GB RAM + 2GB swap)
+- **OS:** Ubuntu 22.04
+- **Process manager:** systemd (`codereview.service`)
+- **HTTPS:** Caddy reverse proxy with automatic Let's Encrypt certs via DuckDNS
+- **Domain:** `ai-code-review.duckdns.org`
+
+```bash
+# Service management
+sudo systemctl status codereview   # check status
+sudo systemctl restart codereview  # restart backend
+sudo systemctl status caddy        # check HTTPS proxy
+```
+
+### Environment variables (Vercel)
+
+| Variable | Value |
+|----------|-------|
+| `VITE_API_URL` | `https://ai-code-review.duckdns.org` |
+
+---
+
 ## Agent Breakdown
 
 ### Bug Agent
@@ -124,13 +162,13 @@ docker-compose up --build
 - Deduplicates by code snippet to avoid repeat findings
 
 ### Security Agent
-- **Static scan first:** Regex patterns for hardcoded secrets, SSL disable, eval, pickle, MD5
-- **LLM analysis:** OWASP Top 10 patterns via 5 semantic queries
+- Static scan first: Regex patterns for hardcoded secrets, SSL disable, eval, pickle, MD5
+- LLM analysis: OWASP Top 10 patterns via 5 semantic queries
 - SQL injection, SSRF, broken auth, insecure deserialization
 
 ### Quality Agent
-- **Radon integration:** Cyclomatic complexity (CC ≥ 10 flagged), Maintainability Index (MI < 20 flagged)
-- **LLM analysis:** Docstring gaps, magic numbers, deep nesting, naming issues
+- Radon integration: Cyclomatic complexity (CC ≥ 10 flagged), Maintainability Index (MI < 20 flagged)
+- LLM analysis: Docstring gaps, magic numbers, deep nesting, naming issues
 - All Python files scanned statically regardless of LLM budget
 
 ### Performance Agent
@@ -144,6 +182,8 @@ docker-compose up --build
 - Scores codebase: `100 - Σ(severity_weight × count)` where critical=20, high=10, medium=4, low=1
 - Generates executive summary via LLM
 - Outputs structured Markdown report
+
+---
 
 ## API Reference
 
@@ -162,10 +202,12 @@ GET /health
   Returns: { "status": "ok" }
 ```
 
+---
+
 ## Project Structure
 
 ```
-ai-code-review-agent/
+AI-CODE-REVIEW/
 ├── backend/
 │   ├── agents/
 │   │   ├── bug_agent.py       # Logic, null refs, exceptions
@@ -188,6 +230,8 @@ ai-code-review-agent/
 └── requirements.txt
 ```
 
+---
+
 ## Roadmap
 
 - [ ] GitHub PR integration (post review as PR comments)
@@ -196,6 +240,8 @@ ai-code-review-agent/
 - [ ] Custom rule configuration per project
 - [ ] CI/CD integration (GitHub Actions step)
 - [ ] Diff-only review mode (only changed files)
+
+---
 
 ## Built With
 
@@ -206,7 +252,9 @@ ai-code-review-agent/
 - [radon](https://radon.readthedocs.io) — Python complexity metrics
 - [FastAPI](https://fastapi.tiangolo.com) — backend
 - [React](https://react.dev) — frontend
+- [Caddy](https://caddyserver.com) — HTTPS reverse proxy
+- [Oracle Cloud](https://www.oracle.com/cloud/free/) — always-free VM hosting
 
 ---
 
-*Built by Kartavya Sonar — MSc Computer Science, University of Leeds*
+Built by **Kartavya Sonar** — MSc Computer Science, University of Leeds
