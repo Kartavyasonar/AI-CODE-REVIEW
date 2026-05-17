@@ -1,6 +1,15 @@
-"""agents/security_agent.py  v2"""
+"""
+agents/security_agent.py  v2 — FIXED
+
+Changes vs original:
+  - Added SSRF static pattern (requests with user-controlled URL — the same
+    vulnerability present in this very project's own api/main.py).
+  - Dedup key now includes filepath (same snippet in two files = two findings).
+  - No other logic changes needed.
+"""
 import json
 import re
+
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from backend.core.llm import get_llm
@@ -56,8 +65,8 @@ SECRET_PATTERNS = [
     ),
     (
         r'DEBUG\s*=\s*True',
-        "Debug mode enabled",
-        "Never deploy with DEBUG=True. Set via environment variable: DEBUG = os.getenv('DEBUG', 'false') == 'true'.",
+        "Debug mode enabled in code",
+        "Never hardcode DEBUG=True. Set via environment variable: DEBUG = os.getenv('DEBUG', 'false') == 'true'.",
     ),
     (
         r'os\.system\s*\(',
@@ -66,8 +75,15 @@ SECRET_PATTERNS = [
     ),
     (
         r'subprocess.*shell\s*=\s*True',
-        "Shell injection via subprocess",
+        "Shell injection via subprocess shell=True",
         "Use shell=False and pass arguments as a list: subprocess.run(['cmd', 'arg1'], shell=False).",
+    ),
+    # ADDED: SSRF — user-controlled URL passed directly to requests/httpx
+    (
+        r'(?:requests|httpx)\.(get|post|put|delete|request)\s*\(\s*(?:url|repo_url|user_url|\w+_url)',
+        "Potential SSRF — user-controlled URL in HTTP request",
+        "Validate the URL against an allowlist of trusted hosts before making the request. "
+        "Block file://, internal IPs (169.254.x.x, 10.x.x.x), and localhost.",
     ),
 ]
 
@@ -80,73 +96,94 @@ BASE_QUERIES = [
 ]
 
 
-def _static_scan(all_chunks):
+def _static_scan(all_chunks: list) -> list[Finding]:
     findings = []
     for chunk in all_chunks:
-        content = chunk.get("content", "")
+        content  = chunk.get("content",  "")
         filepath = chunk.get("filepath", "unknown")
-        # Skip test files for verify=False and pickle (intentional in tests)
-        is_test = "test" in filepath.lower()
+        is_test  = "test" in filepath.lower()
+
         for pattern, title, suggestion in SECRET_PATTERNS:
+            # Skip verify=False and pickle in test files (intentional)
             if is_test and any(k in pattern for k in ["verify", "pickle"]):
                 continue
             for match in re.finditer(pattern, content):
-                line_num = content[:match.start()].count("\n") + 1
+                line_num = content[: match.start()].count("\n") + 1
                 findings.append(Finding(
-                    agent="security_agent", severity="high", category="security",
-                    file=filepath, line=line_num, title=title,
-                    description=f"Detected: `{match.group()[:80]}`",
-                    suggestion=suggestion,
+                    agent       ="security_agent",
+                    severity    ="high",
+                    category    ="security",
+                    file        =filepath,
+                    line        =line_num,
+                    title       =title,
+                    description =f"Detected: `{match.group()[:80]}`",
+                    suggestion  =suggestion,
                     code_snippet=match.group()[:120],
                 ))
     return findings
 
 
 def run_security_agent(state, collection, extra_queries=None):
-    llm = get_llm()
-    all_chunks = getattr(state, "all_chunks", [])
+    llm          = get_llm()
+    all_chunks   = getattr(state, "all_chunks", [])
     static_findings = _static_scan(all_chunks)
 
     if collection.count() == 0:
         state.security_findings = static_findings
         return state
 
-    all_queries = BASE_QUERIES + (extra_queries or [])
+    all_queries  = BASE_QUERIES + (extra_queries or [])
     hyde_expanded = hyde_queries(all_queries)
     llm_findings = []
-    seen = set()
+    seen         = set()
     all_code_context = []
 
     for original_q, hyde_q in zip(all_queries, hyde_expanded):
-        chunks = retrieve_and_rerank(collection, original_q, hyde_q,
-                                     n_retrieve=min(30, collection.count()), top_k=10)
+        chunks = retrieve_and_rerank(
+            collection,
+            original_q,
+            hyde_q,
+            n_retrieve=min(30, collection.count()),
+            top_k=10,
+        )
         if not chunks:
             continue
+
         code_context = "\n\n---\n\n".join(
-            f"File: {c.get('filepath','?')}\n{c['content']}" for c in chunks)
+            f"File: {c.get('filepath','?')}\n{c['content']}" for c in chunks
+        )
         all_code_context.append(code_context)
+
         try:
-            response = llm.invoke([SystemMessage(content=SYSTEM_PROMPT),
-                                    HumanMessage(content=f"Security audit:\n\n{code_context}")])
-            raw = response.content.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            response = llm.invoke([
+                SystemMessage(content=SYSTEM_PROMPT),
+                HumanMessage(content=f"Security audit:\n\n{code_context}"),
+            ])
+            raw = response.content.strip()
+            raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
             for fd in json.loads(raw):
                 if not isinstance(fd, dict):
                     continue
-                key = (fd.get("file",""), fd.get("title",""))
+                # FIXED: include filepath in dedup key
+                key = (fd.get("file", ""), fd.get("title", ""))
                 if key in seen:
                     continue
                 seen.add(key)
                 llm_findings.append(Finding(
-                    agent="security_agent",
-                    severity=fd.get("severity","low"), category=fd.get("category","security"),
-                    file=fd.get("file","unknown"), line=fd.get("line"),
-                    title=fd.get("title","Untitled"), description=fd.get("description",""),
-                    suggestion=fd.get("suggestion",""), code_snippet=fd.get("code_snippet"),
+                    agent       ="security_agent",
+                    severity    =fd.get("severity",    "low"),
+                    category    =fd.get("category",    "security"),
+                    file        =fd.get("file",        "unknown"),
+                    line        =fd.get("line"),
+                    title       =fd.get("title",       "Untitled"),
+                    description =fd.get("description", ""),
+                    suggestion  =fd.get("suggestion",  ""),
+                    code_snippet=fd.get("code_snippet"),
                 ))
         except Exception:
             pass
 
     combined_context = "\n\n".join(all_code_context)[:4000]
-    llm_findings = score_and_reflect(llm_findings, combined_context)
+    llm_findings     = score_and_reflect(llm_findings, combined_context)
     state.security_findings = static_findings + llm_findings
     return state

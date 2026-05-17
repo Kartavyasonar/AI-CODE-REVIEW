@@ -1,26 +1,31 @@
 services:
-  # Backend — FastAPI
   - type: web
     name: ai-code-review-backend
-    runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn backend.api.main:app --host 0.0.0.0 --port $PORT
+    runtime: docker
+    dockerfilePath: ./Dockerfile.backend
+    # FIXED: was using native Python runtime (python-3.11.9) but Dockerfile is better
+    # because it pre-caches the ML models at build time, avoiding OOM on first request.
+    healthCheckPath: /health
     envVars:
       - key: GROQ_API_KEY
-        sync: false          # You enter this manually in Render dashboard
-      - key: PYTHON_VERSION
-        value: 3.12.0
+        sync: false   # set manually in Render dashboard — never commit this value
+      - key: API_SECRET
+        sync: false   # optional; set to enable x-api-key auth
+      - key: MEMORY_DB_DIR
+        value: /opt/render/project/src/memory_db
+      - key: FRONTEND_URL
+        sync: false   # set to your Vercel URL, e.g. https://your-app.vercel.app
+      - key: PORT
+        value: "10000"
+      - key: ANONYMIZED_TELEMETRY
+        value: "false"
+      - key: CHROMA_TELEMETRY
+        value: "false"
     disk:
       name: memory-store
       mountPath: /opt/render/project/src/memory_db
       sizeGB: 1
-
-  # Frontend — React static site (completely free on Render)
-  - type: static
-    name: ai-code-review-frontend
-    buildCommand: cd frontend && npm install && npm run build
-    staticPublishPath: frontend/dist
-    routes:
-      - type: rewrite
-        source: /*
-        destination: /index.html
+    # NOTE: Render free tier gives 512MB RAM.
+    # torch + sentence-transformers need ~700MB.
+    # The Docker image pre-caches models which helps, but you may still hit OOM.
+    # Recommended: upgrade to Starter ($7/mo) or migrate to Railway (see README).

@@ -1,45 +1,56 @@
 """
 core/memory.py  —  Cross-Repo Memory Store
 
-After each review, we persist:
-- Patterns of bugs found (anonymised — just pattern type + file structure)
-- Which queries retrieved the most useful chunks
-- Severity distributions per repo type
+After each review we persist anonymised patterns (bug types, severity distributions)
+so that the NEXT review of a similar repo can:
+  - Bias RAG queries toward historically risky patterns
+  - Benchmark the new repo's score against past similar repos
 
-On the NEXT review, this memory is used to:
-- Bias RAG queries toward patterns seen in similar repos
-- Warn the user if their repo matches a historically risky profile
-- Personalise the executive summary with benchmark comparisons
-
-This is a lightweight implementation using ChromaDB as the memory backend.
-In production you'd use Redis + a proper pattern DB.
+FIXES applied vs original:
+  - MEMORY_DIR resolves from $MEMORY_DB_DIR env var (absolute path).
+    Original used a hardcoded relative "./memory_db" which breaks when the process
+    starts from a different working directory (common on Render/Railway).
+  - get_high_risk_query_hints: removed the fragile int-parsing hack
+    (`int([w for w in doc.split() if w.isdigit()][0])`).
+    Score is now read directly from the metadata dict where it is already stored
+    as an integer — no string parsing needed.
+  - _get_memory_collection: now creates the parent directory if it doesn't exist,
+    preventing PersistentClient from throwing on first run.
 """
 import json
+import os
 import time
 import uuid
-import chromadb
 from pathlib import Path
+
+import chromadb
 from chromadb.utils import embedding_functions
 
-MEMORY_DIR = Path("./memory_db")
+# FIXED: resolve absolute path from env var; fall back to ./memory_db
+MEMORY_DIR  = Path(os.getenv("MEMORY_DB_DIR", "./memory_db")).resolve()
 EMBED_MODEL = "all-MiniLM-L6-v2"
 
 
 def _get_memory_collection() -> chromadb.Collection:
     """Get or create the persistent memory collection."""
+    MEMORY_DIR.mkdir(parents=True, exist_ok=True)   # ensure dir exists before PersistentClient
     client = chromadb.PersistentClient(path=str(MEMORY_DIR))
-    ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=EMBED_MODEL)
+    ef     = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=EMBED_MODEL)
     return client.get_or_create_collection("review_memory", embedding_function=ef)
 
 
 def store_review_patterns(repo_url: str, findings: list, score: int):
-    """Store anonymised patterns — skip storing if score is 0 (means something went wrong)."""
+    """
+    Persist anonymised review patterns.
+    Skips storage if score is 0 (means review failed or produced no output).
+    """
     if score == 0:
-        return  # Don't persist broken/empty review results
+        return
     try:
-        collection = _get_memory_collection()
-        severity_dist = {}
-        category_dist = {}
+        collection      = _get_memory_collection()
+        severity_dist   = {}
+        category_dist   = {}
+
         for f in findings:
             sev = getattr(f, "severity", "unknown")
             cat = getattr(f, "category", "unknown")
@@ -51,26 +62,26 @@ def store_review_patterns(repo_url: str, findings: list, score: int):
             f"Score: {score}/100\n"
             f"Severity distribution: {json.dumps(severity_dist)}\n"
             f"Category distribution: {json.dumps(category_dist)}\n"
-            f"Top issues: {', '.join(getattr(f,'title','') for f in findings[:5])}"
+            f"Top issues: {', '.join(getattr(f, 'title', '') for f in findings[:5])}"
         )
         collection.add(
             ids=[str(uuid.uuid4())],
             documents=[pattern_doc],
             metadatas=[{
-                "repo_url": repo_url,
-                "score": score,
-                "timestamp": time.time(),
+                "repo_url":       repo_url,
+                "score":          score,
+                "timestamp":      time.time(),
                 "total_findings": len(findings),
             }],
         )
     except Exception:
-        pass
+        pass  # Memory store is best-effort; never crash a review because of it
 
 
 def get_similar_repo_insights(repo_url: str, n: int = 3) -> str:
     """
-    Retrieve patterns from the most similar previously reviewed repos.
-    Filters out legacy zero-score entries (from before the scoring fix).
+    Retrieve patterns from the most semantically similar previously reviewed repos.
+    Returns a formatted string for inclusion in the executive summary.
     """
     try:
         collection = _get_memory_collection()
@@ -85,17 +96,14 @@ def get_similar_repo_insights(repo_url: str, n: int = 3) -> str:
         if not results["documents"][0]:
             return ""
 
-        # Filter out legacy zero-scores (stored before logarithmic scoring was added)
-        valid = [
-            m for m in results["metadatas"][0]
-            if m.get("score", 0) > 0
-        ]
-
+        # Filter out legacy zero-score entries (stored before scoring was fixed)
+        valid = [m for m in results["metadatas"][0] if m.get("score", 0) > 0]
         if not valid:
             return ""
 
         insights = [
-            f"- Similar repo scored {m['score']}/100 with {m.get('total_findings','?')} total findings"
+            f"- Similar repo scored {m['score']}/100 "
+            f"with {m.get('total_findings', '?')} total findings"
             for m in valid
         ]
         avg = sum(m["score"] for m in valid) / len(valid)
@@ -111,8 +119,12 @@ def get_similar_repo_insights(repo_url: str, n: int = 3) -> str:
 
 def get_high_risk_query_hints(repo_url: str) -> list[str]:
     """
-    Based on memory of similar repos, return extra queries to add to agents.
-    If repos with similar structure always had auth issues, add auth-focused queries.
+    Based on memory of similar repos, return extra RAG queries for agents.
+    E.g. if similar repos always had auth issues, add auth-focused queries.
+
+    FIXED: original tried to parse `score` out of free-text document strings
+    using `int([w for w in doc.split() if w.isdigit()][0])` — very fragile.
+    Score is already stored as an integer in metadata; read it from there.
     """
     try:
         collection = _get_memory_collection()
@@ -125,19 +137,25 @@ def get_high_risk_query_hints(repo_url: str) -> list[str]:
         )
 
         extra_queries = []
-        for doc in results["documents"][0]:
-            if "security" in doc and "authentication" in doc.lower():
+
+        for doc, meta in zip(
+            results["documents"][0],
+            results["metadatas"][0],
+        ):
+            doc_lower = doc.lower()
+
+            if "security" in doc_lower and "authentication" in doc_lower:
                 extra_queries.append("authentication token session cookie")
-            if "sql" in doc.lower():
+
+            if "sql" in doc_lower:
                 extra_queries.append("database query string format user input")
-            if "high" in doc and "score" in doc:
-                try:
-                    score = int([w for w in doc.split() if w.isdigit()][0])
-                    if score < 50:
-                        extra_queries.append("critical security vulnerability injection")
-                except Exception:
-                    pass
+
+            # FIXED: read score directly from metadata integer, no string parsing
+            score = meta.get("score", 100)
+            if isinstance(score, (int, float)) and score < 50:
+                extra_queries.append("critical security vulnerability injection")
 
         return list(set(extra_queries))[:3]
+
     except Exception:
         return []
