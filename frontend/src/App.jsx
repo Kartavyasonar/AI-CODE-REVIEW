@@ -260,35 +260,28 @@ export default function App() {
       es.onmessage = (e) => {
         try {
           const ev = JSON.parse(e.data);
+          const evType = ev.event || ev.type || "";
 
-          // FIXED: backend now pushes {event: "status"|"complete"|"error", ...}
-          // Frontend previously checked ev.type but backend emitted ev.event.
-          // Support both for backwards compatibility.
-          const evType = ev.type || ev.event || "";
+          // Always add to live log regardless of event type
+          if (ev.ts || ev.message || ev.step) {
+            setSteps(prev => [...prev, {
+              step:   ev.step    || evType || "status",
+              detail: ev.message || ev.detail || "",
+              ts:     ev.ts      || Date.now() / 1000,
+            }]);
+          }
 
-          if (evType === "step" || evType === "status") {
-            setSteps(prev => [...prev, { ...ev, step: ev.step || "status" }]);
-            if (ev.progress != null) setProgress(ev.progress);
-            if (ev.step)   setCurStep(ev.step);
-            if (ev.detail) setCurDetail(ev.detail);
-            if (ev.message && !ev.detail) setCurDetail(ev.message);
-          } else if (evType === "complete") {
+          if (ev.progress != null) setProgress(ev.progress);
+          if (ev.step)             setCurStep(ev.step);
+          if (ev.message)          setCurDetail(ev.message);
+
+          if (evType === "complete") {
             setProgress(100);
             setCurStep("done");
-            setFileCt(ev.file_count   || 0);
-            setChunkCt(ev.chunk_count || 0);
-            // Fetch full result from REST endpoint
             fetch(`${API}/review/${data.job_id}`)
               .then(r => r.json())
-              .then(d => {
-                // API wraps result under d.result
-                setResult(d.result || d);
-                setLoading(false);
-              })
-              .catch(err => {
-                setError(`Failed to fetch results: ${err.message}`);
-                setLoading(false);
-              });
+              .then(d => { setResult(d.result || d); setLoading(false); })
+              .catch(err => { setError(`Failed to fetch results: ${err.message}`); setLoading(false); });
             es.close();
           } else if (evType === "error") {
             setError(ev.error || ev.message || "Unknown pipeline error");
@@ -296,7 +289,7 @@ export default function App() {
             es.close();
           }
         } catch {
-          // Malformed SSE event — ignore (keep-alive comments land here too)
+          // ignore keep-alive comments
         }
       };
 

@@ -13,6 +13,8 @@ Fixes applied:
   - thread-safe access to _active_collections via lock (imported from pipeline)
   - graceful shutdown: mark orphaned running jobs as failed on startup
 """
+from dotenv import load_dotenv
+load_dotenv()
 import asyncio
 import json
 import os
@@ -156,51 +158,77 @@ class ReviewRequest(BaseModel):
 # ── Background review worker ───────────────────────────────────────────────────
 
 def _run_review_worker(job_id: str, repo_url: str):
-    """
-    Runs in a daemon thread. Calls the pipeline's synchronous entry point,
-    then serialises all findings into plain dicts before storing.
-    """
     try:
-        push(job_id, "status", message="Starting pipeline...", progress=5)
+        push(job_id, "status", message="Starting pipeline...", step="status", progress=5)
 
-        # Import here so env vars are loaded before chromadb initialises
         from backend.core.pipeline import run_review_sync as pipeline_sync
 
-        push(job_id, "status", message="Cloning & ingesting repository...", progress=10)
+        push(job_id, "status", message="Cloning & ingesting repository...", step="cloning", progress=10)
+        
+        # Monkey-patch console to also push SSE events
+        import backend.core.pipeline as _pipeline_mod
+        original_log = _pipeline_mod.console.log
+
+        def _patched_log(msg, *a, **kw):
+            original_log(msg, *a, **kw)
+            clean = msg
+            for tag in ["[bold cyan]","[bold yellow]","[bold red]","[bold blue]",
+                        "[bold green]","[bold magenta]","[/bold cyan]","[/bold yellow]",
+                        "[/bold red]","[/bold blue]","[/bold green]","[/bold magenta]",
+                        "[cyan]","[red]","[green]","[blue]","[magenta]",
+                        "[/cyan]","[/red]","[/green]","[/blue]","[/magenta]"]:
+                clean = clean.replace(tag, "")
+            clean = clean.strip()
+            if not clean:
+                return
+            # Map log messages to step names and progress
+            if "Cloning" in clean or "Ingesting" in clean:
+                push(job_id, "status", message=clean, step="cloning", progress=15)
+            elif "chunks embedded" in clean or "Embedded" in clean:
+                push(job_id, "status", message=clean, step="embedding", progress=30)
+            elif "Bug" in clean and "AGENT" in clean:
+                push(job_id, "status", message="Bug agent: HyDE + rerank + reflect...", step="agent_bug", progress=40)
+            elif "Security" in clean and "AGENT" in clean:
+                push(job_id, "status", message="Security agent: HyDE + rerank + reflect...", step="agent_security", progress=55)
+            elif "Quality" in clean and "AGENT" in clean:
+                push(job_id, "status", message="Quality agent: HyDE + rerank + reflect...", step="agent_quality", progress=65)
+            elif "Performance" in clean and "AGENT" in clean:
+                push(job_id, "status", message="Performance agent: HyDE + rerank + reflect...", step="agent_perf", progress=75)
+            elif "chain" in clean.lower() or "REFLECT" in clean:
+                push(job_id, "status", message="Multi-hop chain detection...", step="chains", progress=85)
+            elif "Synthesiz" in clean:
+                push(job_id, "status", message="Synthesizing final report...", step="synthesizing", progress=90)
+
+        _pipeline_mod.console.log = _patched_log
+
         result = pipeline_sync(repo_url)
 
-        # Serialise Finding objects → dicts
-        bug_f  = _findings_to_dicts(result.get("bug_findings",  []))
+        # Restore original
+        _pipeline_mod.console.log = original_log
+
+        bug_f  = _findings_to_dicts(result.get("bug_findings",      []))
         sec_f  = _findings_to_dicts(result.get("security_findings", []))
-        qual_f = _findings_to_dicts(result.get("quality_findings", []))
-        perf_f = _findings_to_dicts(result.get("perf_findings",  []))
+        qual_f = _findings_to_dicts(result.get("quality_findings",  []))
+        perf_f = _findings_to_dicts(result.get("perf_findings",     []))
         total  = len(bug_f) + len(sec_f) + len(qual_f) + len(perf_f)
 
         serialised = {
-            "summary":         result.get("summary", ""),
-            "score":           result.get("score", 0),
-            "report_markdown": result.get("report_markdown", ""),
-            "total_findings":  total,
-            "bug_findings":    bug_f,
+            "summary":           result.get("summary", ""),
+            "score":             result.get("score", 0),
+            "report_markdown":   result.get("report_markdown", ""),
+            "total_findings":    total,
+            "bug_findings":      bug_f,
             "security_findings": sec_f,
             "quality_findings":  qual_f,
             "perf_findings":     perf_f,
-            "findings": {
-                "bugs":        len(bug_f),
-                "security":    len(sec_f),
-                "quality":     len(qual_f),
-                "performance": len(perf_f),
-            },
         }
 
         with _jobs_lock:
             jobs[job_id]["result"] = serialised
             jobs[job_id]["status"] = "complete"
 
-        push(job_id, "complete",
-             score=serialised["score"],
-             total_findings=total,
-             progress=100)
+        push(job_id, "complete", score=serialised["score"],
+             total_findings=total, progress=100)
 
     except Exception as e:
         import traceback

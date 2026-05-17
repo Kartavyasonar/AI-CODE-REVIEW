@@ -169,7 +169,7 @@ def chunk_file(file_info: dict) -> list:
 
 def build_vector_store(chunks: list, collection_name: str):
     ef     = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=EMBED_MODEL)
-    client = chromadb.Client()  # in-memory: no disk writes, no telemetry
+    client = chromadb.EphemeralClient() # in-memory: no disk writes, no telemetry
 
     try:
         client.delete_collection(collection_name)
