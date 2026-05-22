@@ -285,13 +285,37 @@ export default function App() {
       };
 
       es.onerror = () => {
-        // Only surface as error if we're still loading (not after successful close)
-        if (loading) {
-          setError("Connection to backend lost. The review may still be running — refresh to check.");
+      es.close();
+      // SSE dropped — poll every 5s until result is ready
+      const pollInterval = setInterval(async () => {
+        try {
+          const r = await fetch(`${API}/review/${data.job_id}`);
+          const d = await r.json();
+          if (d.status === "complete") {
+            clearInterval(pollInterval);
+            setResult(d.result || d);
+            setProgress(100);
+            setCurStep("done");
+            setLoading(false);
+          } else if (d.status === "failed") {
+            clearInterval(pollInterval);
+            setError("Review failed on server.");
+            setLoading(false);
+          }
+          // if status === "running" keep polling
+        } catch {
+          // network hiccup — keep polling
         }
-        es.close();
-        setLoading(false);
-      };
+      }, 5000);
+      // Hard stop after 15 minutes
+      setTimeout(() => {
+        clearInterval(pollInterval);
+        if (loading) {
+          setLoading(false);
+          setError("Timed out. Try refreshing the page.");
+        }
+      }, 900000);
+    };
 
     } catch(e) {
       setError(`${e.message}`);
