@@ -1,11 +1,13 @@
 """
-agents/security_agent.py  v2 — FIXED
+agents/security_agent.py  v3
 
-Changes vs original:
-  - Added SSRF static pattern (requests with user-controlled URL — the same
-    vulnerability present in this very project's own api/main.py).
-  - Dedup key now includes filepath (same snippet in two files = two findings).
-  - No other logic changes needed.
+Improvements vs v2:
+  1. Test file filtering on static scan — expanded to cover more test patterns
+  2. Example code filtering — tutorial code like flask/examples not flagged as prod issues
+  3. File type context in LLM prompt
+  4. Smarter static scan — severity is contextual not always "high"
+  5. Better dedup — normalized title matching
+  6. Static scan results also filtered through test/example classifier
 """
 import json
 import re
@@ -19,9 +21,18 @@ from backend.core.reflection import score_and_reflect
 from backend.core.state import Finding
 
 SYSTEM_PROMPT = """You are a senior application security engineer.
+
 Analyze for OWASP Top 10: SQL Injection, Command Injection, XSS, Broken Auth,
 Sensitive Data Exposure, Insecure Deserialization (pickle/eval), SSRF, weak CORS.
 Also: hardcoded secrets, MD5/SHA1 passwords, SSL verify=False.
+
+IMPORTANT RULES:
+- IGNORE files marked as [TEST FILE] — security patterns in tests are intentional mocks
+- IGNORE files marked as [EXAMPLE CODE] — tutorial code intentionally shows vulnerabilities
+- For PRODUCTION files only, flag real vulnerabilities with evidence from the code
+- eval() in a CLI tool's REPL feature is NOT a vulnerability — it is intentional
+- DEBUG=True in a tutorial config is NOT a production issue
+- Only flag issues where real user data could be compromised in production
 
 Respond ONLY with valid JSON array:
 {
@@ -30,60 +41,77 @@ Respond ONLY with valid JSON array:
   "file": "<filepath>",
   "line": <line or null>,
   "title": "<vulnerability name>",
-  "description": "<attack scenario>",
+  "description": "<attack scenario in production>",
   "suggestion": "<concrete fix>",
   "code_snippet": "<vulnerable code, max 3 lines>"
 }
 Only JSON. No markdown. Return [].
 """
 
+# (pattern, title, suggestion, severity, skip_in_examples)
 SECRET_PATTERNS = [
     (
-        r'(?i)(api_key|apikey|secret|password|token|passwd)\s*=\s*["\'][^"\']{8,}["\']',
-        "Hardcoded secret",
-        "Move this value to an environment variable and load with os.getenv() or python-dotenv.",
+        r'(?i)(api_key|apikey|secret_key|password|passwd|token)\s*=\s*["\'][^"\']{8,}["\']',
+        "Hardcoded secret or credential",
+        "Move to environment variable: os.getenv('KEY_NAME'). Never commit secrets to git.",
+        "critical",
+        False,  # flag even in examples
     ),
     (
         r'verify\s*=\s*False',
         "SSL verification disabled",
-        "Set verify=True (default). If testing locally, use a proper CA bundle instead of disabling verification.",
+        "Remove verify=False. Use a proper CA bundle or fix certificate issues instead.",
+        "high",
+        True,   # skip in test/example files
     ),
     (
         r'pickle\.loads\s*\(',
         "Unsafe pickle deserialization",
-        "Never unpickle data from untrusted sources. Use json.loads() or a safe serialization format instead.",
+        "Never unpickle untrusted data. Use json.loads() or a safe format instead.",
+        "high",
+        True,
     ),
     (
         r'\beval\s*\(',
         "Dangerous eval() usage",
-        "Avoid eval() entirely. Use ast.literal_eval() for safe expression parsing, or refactor the logic.",
+        "Avoid eval(). Use ast.literal_eval() for safe parsing, or refactor the logic.",
+        "high",
+        True,
     ),
     (
         r'(?i)(md5|sha1)\s*\(',
         "Weak cryptographic hash",
-        "MD5/SHA1 are broken for security use. Use hashlib.sha256() or bcrypt/argon2 for passwords.",
+        "Use hashlib.sha256() for general hashing, bcrypt/argon2 for passwords.",
+        "high",
+        True,
     ),
     (
         r'DEBUG\s*=\s*True',
-        "Debug mode enabled in code",
-        "Never hardcode DEBUG=True. Set via environment variable: DEBUG = os.getenv('DEBUG', 'false') == 'true'.",
+        "Debug mode hardcoded to True",
+        "Set via env var: DEBUG = os.getenv('DEBUG', 'false') == 'true'",
+        "medium",
+        True,   # skip in example/tutorial configs
     ),
     (
         r'os\.system\s*\(',
         "Shell injection via os.system",
-        "Replace os.system() with subprocess.run([...], shell=False) and pass arguments as a list.",
+        "Use subprocess.run([...], shell=False) with args as a list.",
+        "high",
+        True,
     ),
     (
         r'subprocess.*shell\s*=\s*True',
         "Shell injection via subprocess shell=True",
-        "Use shell=False and pass arguments as a list: subprocess.run(['cmd', 'arg1'], shell=False).",
+        "Use shell=False and pass arguments as a list.",
+        "high",
+        True,
     ),
-    # ADDED: SSRF — user-controlled URL passed directly to requests/httpx
     (
         r'(?:requests|httpx)\.(get|post|put|delete|request)\s*\(\s*(?:url|repo_url|user_url|\w+_url)',
         "Potential SSRF — user-controlled URL in HTTP request",
-        "Validate the URL against an allowlist of trusted hosts before making the request. "
-        "Block file://, internal IPs (169.254.x.x, 10.x.x.x), and localhost.",
+        "Validate URL against allowlist. Block file://, internal IPs, localhost.",
+        "medium",
+        True,
     ),
 ]
 
@@ -95,32 +123,58 @@ BASE_QUERIES = [
     "requests http url user input fetch external",
 ]
 
+_TEST_MARKERS    = {"test_", "_test", "tests/", "/tests/", "conftest", "fixtures"}
+_EXAMPLE_MARKERS = {"examples/", "/examples/", "tutorial/", "demo/", "sample/"}
+
+
+def _classify_file(filepath: str) -> str:
+    fp = filepath.lower().replace("\\", "/")
+    if any(m in fp for m in _TEST_MARKERS):
+        return "TEST FILE"
+    if any(m in fp for m in _EXAMPLE_MARKERS):
+        return "EXAMPLE CODE"
+    return "PRODUCTION"
+
+
+def _is_test_or_example(filepath: str) -> bool:
+    fp = filepath.lower().replace("\\", "/")
+    return any(m in fp for m in _TEST_MARKERS) or any(m in fp for m in _EXAMPLE_MARKERS)
+
 
 def _static_scan(all_chunks: list) -> list[Finding]:
     findings = []
     for chunk in all_chunks:
         content  = chunk.get("content",  "")
         filepath = chunk.get("filepath", "unknown")
-        is_test  = "test" in filepath.lower()
+        file_class = _classify_file(filepath)
+        is_test_or_example = file_class in ("TEST FILE", "EXAMPLE CODE")
 
-        for pattern, title, suggestion in SECRET_PATTERNS:
-            # Skip verify=False and pickle in test files (intentional)
-            if is_test and any(k in pattern for k in ["verify", "pickle"]):
+        for pattern, title, suggestion, severity, skip_in_examples in SECRET_PATTERNS:
+            if skip_in_examples and is_test_or_example:
                 continue
             for match in re.finditer(pattern, content):
                 line_num = content[: match.start()].count("\n") + 1
                 findings.append(Finding(
                     agent       ="security_agent",
-                    severity    ="high",
+                    severity    =severity,
                     category    ="security",
                     file        =filepath,
                     line        =line_num,
                     title       =title,
-                    description =f"Detected: `{match.group()[:80]}`",
+                    description =f"Detected in {file_class}: `{match.group()[:80]}`",
                     suggestion  =suggestion,
                     code_snippet=match.group()[:120],
                 ))
     return findings
+
+
+def _should_skip_finding(fd: dict) -> bool:
+    filepath = fd.get("file", "").lower().replace("\\", "/")
+    return _is_test_or_example(filepath)
+
+
+def _normalize_title(title: str) -> str:
+    return re.sub(r'\s+', ' ', title.lower().strip())
 
 
 def run_security_agent(state, collection, extra_queries=None):
@@ -132,10 +186,10 @@ def run_security_agent(state, collection, extra_queries=None):
         state.security_findings = static_findings
         return state
 
-    all_queries  = BASE_QUERIES + (extra_queries or [])
+    all_queries   = BASE_QUERIES + (extra_queries or [])
     hyde_expanded = hyde_queries(all_queries)
-    llm_findings = []
-    seen         = set()
+    llm_findings  = []
+    seen          = set()
     all_code_context = []
 
     for original_q, hyde_q in zip(all_queries, hyde_expanded):
@@ -150,7 +204,8 @@ def run_security_agent(state, collection, extra_queries=None):
             continue
 
         code_context = "\n\n---\n\n".join(
-            f"File: {c.get('filepath','?')}\n{c['content']}" for c in chunks
+            f"File: {c.get('filepath','?')} [{_classify_file(c.get('filepath',''))}]\n{c['content']}"
+            for c in chunks
         )
         all_code_context.append(code_context)
 
@@ -164,8 +219,9 @@ def run_security_agent(state, collection, extra_queries=None):
             for fd in json.loads(raw):
                 if not isinstance(fd, dict):
                     continue
-                # FIXED: include filepath in dedup key
-                key = (fd.get("file", ""), fd.get("title", ""))
+                if _should_skip_finding(fd):
+                    continue
+                key = (fd.get("file", ""), _normalize_title(fd.get("title", "")))
                 if key in seen:
                     continue
                 seen.add(key)

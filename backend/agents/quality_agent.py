@@ -1,9 +1,12 @@
 """
-agents/quality_agent.py  v2 — FIXED
+agents/quality_agent.py  v3
 
-Changes vs original:
-  - Dedup key now consistently (file, title) — same as other agents.
-  - No other logic changes needed.
+Improvements vs v2:
+  1. Complexity scan skips test files — test functions are intentionally complex
+  2. File type context in LLM prompt
+  3. LLM prompt explicitly ignores test file quality issues
+  4. Higher CC threshold for test files (15 instead of 10)
+  5. Maintainability index skipped for test files entirely
 """
 import json
 from pathlib import Path
@@ -23,9 +26,18 @@ try:
 except ImportError:
     RADON_AVAILABLE = False
 
-SYSTEM_PROMPT = """You are a senior engineer focused on code quality.
-Analyze for: missing docstrings, functions >50 lines, deep nesting (>3 levels),
-magic numbers, poor naming, duplicate code, unused imports, missing type annotations.
+SYSTEM_PROMPT = """You are a senior engineer focused on code quality in PRODUCTION code.
+
+Analyze for: missing docstrings on public functions, functions >50 lines,
+deep nesting (>3 levels), magic numbers, poor naming, duplicate code,
+unused imports, missing type annotations on public APIs.
+
+IMPORTANT RULES:
+- IGNORE files marked as [TEST FILE] — tests intentionally have different quality standards
+- IGNORE files marked as [EXAMPLE CODE] — tutorials prioritize readability over production quality
+- Only flag quality issues in [PRODUCTION] files
+- Missing docstrings in test functions is acceptable
+- Complex test setup functions are acceptable
 
 Respond ONLY with valid JSON array:
 {
@@ -34,7 +46,7 @@ Respond ONLY with valid JSON array:
   "file": "<filepath>",
   "line": <line or null>,
   "title": "<issue>",
-  "description": "<why it matters>",
+  "description": "<why it matters in production>",
   "suggestion": "<fix>",
   "code_snippet": "<code, max 3 lines>"
 }
@@ -49,6 +61,23 @@ BASE_QUERIES = [
     "duplicate code repeated logic",
 ]
 
+_TEST_MARKERS    = {"test_", "_test", "tests/", "/tests/", "conftest", "fixtures"}
+_EXAMPLE_MARKERS = {"examples/", "/examples/", "tutorial/", "demo/", "sample/"}
+
+
+def _classify_file(filepath: str) -> str:
+    fp = filepath.lower().replace("\\", "/")
+    if any(m in fp for m in _TEST_MARKERS):
+        return "TEST FILE"
+    if any(m in fp for m in _EXAMPLE_MARKERS):
+        return "EXAMPLE CODE"
+    return "PRODUCTION"
+
+
+def _is_test_or_example(filepath: str) -> bool:
+    fp = filepath.lower().replace("\\", "/")
+    return any(m in fp for m in _TEST_MARKERS) or any(m in fp for m in _EXAMPLE_MARKERS)
+
 
 def _complexity_scan(repo_path: str) -> list[Finding]:
     if not RADON_AVAILABLE or not repo_path:
@@ -58,12 +87,21 @@ def _complexity_scan(repo_path: str) -> list[Finding]:
         for py_file in Path(repo_path).rglob("*.py"):
             if any(p in py_file.parts for p in [".git", "venv", "__pycache__", "node_modules"]):
                 continue
+
+            rel = str(py_file.relative_to(repo_path))
+            is_test = _is_test_or_example(rel)
+
+            # Use higher threshold for test files
+            cc_threshold = 20 if is_test else 10
+
             try:
                 content = py_file.read_text(encoding="utf-8", errors="ignore")
-                rel     = str(py_file.relative_to(repo_path))
 
                 for block in cc_visit(content):
-                    if block.complexity >= 10:
+                    if block.complexity >= cc_threshold:
+                        # Skip test files for complexity unless extremely complex
+                        if is_test and block.complexity < 25:
+                            continue
                         sev = "high" if block.complexity >= 15 else "medium"
                         findings.append(Finding(
                             agent       ="quality_agent",
@@ -72,24 +110,26 @@ def _complexity_scan(repo_path: str) -> list[Finding]:
                             file        =rel,
                             line        =block.lineno,
                             title       =f"High complexity: {block.name} (CC={block.complexity})",
-                            description =f"Cyclomatic complexity {block.complexity}. Above 10 is hard to test.",
-                            suggestion  ="Break into smaller functions. Target CC < 5.",
+                            description =f"Cyclomatic complexity {block.complexity}. Above 10 is hard to test and maintain.",
+                            suggestion  ="Break into smaller functions with single responsibilities. Target CC < 5.",
                             code_snippet=f"def {block.name}(...):  # CC={block.complexity}",
                         ))
 
-                mi = mi_visit(content, multi=True)
-                if isinstance(mi, (int, float)) and mi < 20:
-                    findings.append(Finding(
-                        agent       ="quality_agent",
-                        severity    ="medium",
-                        category    ="quality",
-                        file        =rel,
-                        line        =None,
-                        title       =f"Low maintainability index: {mi:.1f}/100",
-                        description =f"MI={mi:.1f}. Below 20 is considered unmaintainable.",
-                        suggestion  ="Add docstrings, reduce function size.",
-                        code_snippet=None,
-                    ))
+                # Skip MI for test files entirely
+                if not is_test:
+                    mi = mi_visit(content, multi=True)
+                    if isinstance(mi, (int, float)) and mi < 20:
+                        findings.append(Finding(
+                            agent       ="quality_agent",
+                            severity    ="medium",
+                            category    ="quality",
+                            file        =rel,
+                            line        =None,
+                            title       =f"Low maintainability index: {mi:.1f}/100",
+                            description =f"MI={mi:.1f}. Below 20 indicates unmaintainable code.",
+                            suggestion  ="Add docstrings, reduce function size, simplify logic.",
+                            code_snippet=None,
+                        ))
             except Exception:
                 pass
     except Exception:
@@ -97,9 +137,13 @@ def _complexity_scan(repo_path: str) -> list[Finding]:
     return findings
 
 
+def _should_skip_finding(fd: dict) -> bool:
+    return _is_test_or_example(fd.get("file", ""))
+
+
 def run_quality_agent(state, collection, extra_queries=None):
-    llm        = get_llm()
-    repo_path  = getattr(state, "repo_path", "")
+    llm       = get_llm()
+    repo_path = getattr(state, "repo_path", "")
     static_findings = _complexity_scan(repo_path)
 
     if collection.count() == 0:
@@ -124,7 +168,8 @@ def run_quality_agent(state, collection, extra_queries=None):
             continue
 
         code_context = "\n\n---\n\n".join(
-            f"File: {c.get('filepath','?')}\n{c['content']}" for c in chunks
+            f"File: {c.get('filepath','?')} [{_classify_file(c.get('filepath',''))}]\n{c['content']}"
+            for c in chunks
         )
         all_code_context.append(code_context)
 
@@ -137,6 +182,8 @@ def run_quality_agent(state, collection, extra_queries=None):
             raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
             for fd in json.loads(raw):
                 if not isinstance(fd, dict):
+                    continue
+                if _should_skip_finding(fd):
                     continue
                 key = (fd.get("file", ""), fd.get("title", ""))
                 if key in seen:

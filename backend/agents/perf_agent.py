@@ -1,12 +1,13 @@
 """
-agents/perf_agent.py  v2 — FIXED
+agents/perf_agent.py  v3
 
-Changes vs original:
-  - Dedup key now uses (file, title) tuple consistently
-    (original was already doing this correctly, no change needed here).
-  - No other logic changes.
+Improvements vs v2:
+  1. Test file filtering — performance patterns in tests are acceptable
+  2. File type context in LLM prompt
+  3. Tighter prompt — ignores test setup patterns
 """
 import json
+import re
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -16,9 +17,17 @@ from backend.core.reranker import retrieve_and_rerank
 from backend.core.reflection import score_and_reflect
 from backend.core.state import Finding
 
-SYSTEM_PROMPT = """You are a performance engineering expert.
+SYSTEM_PROMPT = """You are a performance engineering expert analyzing PRODUCTION code.
+
 Analyze for: O(n²) algorithms, N+1 database queries, blocking I/O in async,
 string concat in loops, missing caching, unbounded memory growth, SELECT *.
+
+IMPORTANT RULES:
+- IGNORE files marked as [TEST FILE] — performance is not critical in tests
+- IGNORE files marked as [EXAMPLE CODE] — tutorial code prioritizes clarity over performance
+- Only flag issues in [PRODUCTION] files where real users will be affected
+- Nested loops in test setup are acceptable
+- Only flag issues with clear performance impact evidence in the code
 
 Respond ONLY with valid JSON array:
 {
@@ -27,8 +36,8 @@ Respond ONLY with valid JSON array:
   "file": "<filepath>",
   "line": <line or null>,
   "title": "<issue>",
-  "description": "<why slow>",
-  "suggestion": "<concrete fix>",
+  "description": "<why slow and what the real-world impact is>",
+  "suggestion": "<concrete fix with example>",
   "code_snippet": "<slow code, max 3 lines>"
 }
 Only JSON. Return [].
@@ -41,6 +50,27 @@ BASE_QUERIES = [
     "sort nested loop O n squared algorithm",
     "select all columns memory load entire file",
 ]
+
+_TEST_MARKERS    = {"test_", "_test", "tests/", "/tests/", "conftest", "fixtures"}
+_EXAMPLE_MARKERS = {"examples/", "/examples/", "tutorial/", "demo/", "sample/"}
+
+
+def _classify_file(filepath: str) -> str:
+    fp = filepath.lower().replace("\\", "/")
+    if any(m in fp for m in _TEST_MARKERS):
+        return "TEST FILE"
+    if any(m in fp for m in _EXAMPLE_MARKERS):
+        return "EXAMPLE CODE"
+    return "PRODUCTION"
+
+
+def _is_test_or_example(filepath: str) -> bool:
+    fp = filepath.lower().replace("\\", "/")
+    return any(m in fp for m in _TEST_MARKERS) or any(m in fp for m in _EXAMPLE_MARKERS)
+
+
+def _normalize_title(title: str) -> str:
+    return re.sub(r'\s+', ' ', title.lower().strip())
 
 
 def run_perf_agent(state, collection, extra_queries=None):
@@ -68,7 +98,8 @@ def run_perf_agent(state, collection, extra_queries=None):
             continue
 
         code_context = "\n\n---\n\n".join(
-            f"File: {c.get('filepath','?')}\n{c['content']}" for c in chunks
+            f"File: {c.get('filepath','?')} [{_classify_file(c.get('filepath',''))}]\n{c['content']}"
+            for c in chunks
         )
         all_code_context.append(code_context)
 
@@ -82,7 +113,10 @@ def run_perf_agent(state, collection, extra_queries=None):
             for fd in json.loads(raw):
                 if not isinstance(fd, dict):
                     continue
-                key = (fd.get("file", ""), fd.get("title", ""))
+                # Skip test and example findings
+                if _is_test_or_example(fd.get("file", "")):
+                    continue
+                key = (fd.get("file", ""), _normalize_title(fd.get("title", "")))
                 if key in seen:
                     continue
                 seen.add(key)

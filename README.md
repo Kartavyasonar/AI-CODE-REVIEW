@@ -257,4 +257,8 @@ AI-CODE-REVIEW/
 
 ---
 
+<<<<<<< HEAD
 Built by **Kartavya Sonar** — MSc Computer Science, University of Leeds
+=======
+Built by **Kartavya Sonar** — MSc Computer Science, University of Leeds
+>>>>>>> 0e69695 (fix: chromadb EphemeralClient permanent fix)
