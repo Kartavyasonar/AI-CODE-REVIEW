@@ -14,7 +14,7 @@ import shutil
 import tempfile
 import uuid
 from pathlib import Path
-
+from backend.core.chroma_client import new_client
 os.environ["ANONYMIZED_TELEMETRY"] = "false"
 os.environ["CHROMA_TELEMETRY"]     = "false"
 logging.getLogger("chromadb").setLevel(logging.CRITICAL)
@@ -115,21 +115,12 @@ def chunk_file(file_info: dict) -> list:
 
 def build_vector_store(chunks: list, collection_name: str):
     ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=EMBED_MODEL)
-    
-    # FIX: Use PersistentClient with temp dir to avoid EphemeralClient tenant bug
-    chroma_temp_dir = tempfile.mkdtemp(prefix="chroma_")
-    
-    client = chromadb.PersistentClient(
-        path=chroma_temp_dir,
-        settings=Settings(anonymized_telemetry=False)
-    )
 
-    try:
-        client.delete_collection(collection_name)
-    except Exception:
-        pass
+    # FIX: isolated, self-tested client — immune to stale DBs and env leakage
+    client, chroma_temp_dir = new_client()
 
-    collection = client.create_collection(name=collection_name, embedding_function=ef)
+    collection = client.get_or_create_collection(
+        name=collection_name, embedding_function=ef)
 
     if not chunks:
         console.log("[yellow]Warning:[/yellow] No chunks to embed.")
@@ -137,18 +128,19 @@ def build_vector_store(chunks: list, collection_name: str):
 
     batch_size = 50
     total_batches = (len(chunks) - 1) // batch_size + 1
-
     for i in range(0, len(chunks), batch_size):
         batch = chunks[i: i + batch_size]
         clean_meta = []
         for c in batch:
             m = {k: v for k, v in c.items() if k not in ("id", "content") and v is not None}
-            clean_meta.append({k: str(v) if not isinstance(v, (str, int, float, bool)) else v for k, v in m.items()})
-        collection.add(ids=[c["id"] for c in batch], documents=[c["content"] for c in batch], metadatas=clean_meta)
-        batch_num = i // batch_size + 1
-        if batch_num % 10 == 0 or batch_num == total_batches:
-            console.log(f"[blue]Embedded[/blue] batch {batch_num}/{total_batches}")
-
+            clean_meta.append({k: str(v) if not isinstance(v, (str, int, float, bool)) else v
+                               for k, v in m.items()})
+        collection.add(ids=[c["id"] for c in batch],
+                       documents=[c["content"] for c in batch],
+                       metadatas=clean_meta)
+        bn = i // batch_size + 1
+        if bn % 10 == 0 or bn == total_batches:
+            console.log(f"[blue]Embedded[/blue] batch {bn}/{total_batches}")
     return collection, chroma_temp_dir
 
 def ingest_repo(repo_url: str):
