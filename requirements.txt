@@ -4,7 +4,7 @@ langgraph==0.2.28
 langchain==0.3.1
 langchain-groq==0.2.0
 langchain-community==0.3.1
-chromadb==0.5.15
+chromadb==0.4.24
 sentence-transformers==3.1.1
 torch>=2.2.0
 gitpython==3.1.43
