@@ -1,8 +1,8 @@
 """
 api/main.py — FastAPI backend with SSE streaming
 Fixes applied:
+  - ChromaDB deployment-proof health check
   - run_pipeline NameError removed; delegates to pipeline.run_review_sync
-  - ingest_repo no longer called directly (pipeline handles it internally)
   - Finding objects serialised via _findings_to_dicts before storage
   - jobs dict TTL eviction to prevent OOM
   - SSRF protection via URL allowlist
@@ -36,11 +36,26 @@ os.environ["ANONYMIZED_TELEMETRY"] = "false"
 jobs: dict = {}
 _jobs_lock = threading.Lock()
 
-JOB_TTL_SECONDS = 3600          # evict completed/failed jobs after 1 hour
-MAX_CONCURRENT_REVIEWS = 5      # refuse new jobs if already at limit
+JOB_TTL_SECONDS = 3600
+MAX_CONCURRENT_REVIEWS = 5
 
 ALLOWED_HOSTS = {"github.com", "gitlab.com", "bitbucket.org"}
 
+# ── ChromaDB health status (probed at startup) ─────────────────────────────────
+CHROMA_STATUS = {"status": "not checked"}
+
+def _probe_chromadb() -> str:
+    """One-shot ChromaDB health probe. Returns 'ok (version)' or error string."""
+    try:
+        from backend.core.chroma_client import new_client
+        client, temp_dir = new_client(prefix="chroma_health_")
+        client.list_collections()
+        import shutil
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        import chromadb
+        return f"ok (chromadb {chromadb.__version__})"
+    except Exception as e:
+        return f"BROKEN: {e}"
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -54,7 +69,6 @@ def _findings_to_dicts(findings: list) -> list:
             result.append(f)
     return result
 
-
 def _evict_old_jobs():
     """Remove completed/failed jobs older than JOB_TTL_SECONDS."""
     now = time.time()
@@ -67,7 +81,6 @@ def _evict_old_jobs():
         for jid in to_delete:
             jobs.pop(jid, None)
 
-
 def push(job_id: str, event: str, **kwargs):
     """Append an SSE event dict to the job's event queue."""
     with _jobs_lock:
@@ -78,32 +91,30 @@ def push(job_id: str, event: str, **kwargs):
                 **kwargs,
             })
 
-
 # ── Keep-alive self-ping (prevents Render free-tier sleep) ─────────────────────
 
 async def _self_ping():
     port = os.getenv("PORT", "8000")
-    await asyncio.sleep(60)          # initial grace period at startup
+    await asyncio.sleep(60)
     while True:
         try:
             async with httpx.AsyncClient() as client:
                 await client.get(f"http://localhost:{port}/health", timeout=5)
         except Exception:
             pass
-        await asyncio.sleep(300)     # ping every 5 min (Render sleeps at 15 min)
-
+        await asyncio.sleep(300)
 
 # ── Lifespan ───────────────────────────────────────────────────────────────────
 
-CHROMA_STATUS = {"status": "not checked"}
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    from backend.core.chroma_client import probe
-    CHROMA_STATUS["status"] = probe()          # runs once at boot
+    CHROMA_STATUS["status"] = _probe_chromadb()
+    with _jobs_lock:
+        for j in jobs.values():
+            if j["status"] == "running":
+                j["status"] = "failed"
     asyncio.create_task(_self_ping())
     yield
-
 
 # ── App ────────────────────────────────────────────────────────────────────────
 
@@ -117,11 +128,9 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization", "Accept", "Cache-Control"],
 )
 
-
 # ── Optional API-key auth ──────────────────────────────────────────────────────
 
 _API_SECRET = os.getenv("API_SECRET", "")
-
 
 async def _verify_token(request: Request):
     """If API_SECRET env var is set, require matching x-api-key header."""
@@ -129,7 +138,6 @@ async def _verify_token(request: Request):
         key = request.headers.get("x-api-key", "")
         if key != _API_SECRET:
             raise HTTPException(status_code=403, detail="Invalid or missing API key")
-
 
 # ── Request model ──────────────────────────────────────────────────────────────
 
@@ -153,7 +161,6 @@ class ReviewRequest(BaseModel):
             )
         return v
 
-
 # ── Background review worker ───────────────────────────────────────────────────
 
 def _run_review_worker(job_id: str, repo_url: str):
@@ -164,7 +171,6 @@ def _run_review_worker(job_id: str, repo_url: str):
 
         push(job_id, "status", message="Cloning & ingesting repository...", step="cloning", progress=10)
         
-        # Monkey-patch console to also push SSE events
         import backend.core.pipeline as _pipeline_mod
         original_log = _pipeline_mod.console.log
 
@@ -180,7 +186,6 @@ def _run_review_worker(job_id: str, repo_url: str):
             clean = clean.strip()
             if not clean:
                 return
-            # Map log messages to step names and progress
             if "Cloning" in clean or "Ingesting" in clean:
                 push(job_id, "status", message=clean, step="cloning", progress=15)
             elif "chunks embedded" in clean or "Embedded" in clean:
@@ -202,7 +207,6 @@ def _run_review_worker(job_id: str, repo_url: str):
 
         result = pipeline_sync(repo_url)
 
-        # Restore original
         _pipeline_mod.console.log = original_log
 
         bug_f  = _findings_to_dicts(result.get("bug_findings",      []))
@@ -237,31 +241,28 @@ def _run_review_worker(job_id: str, repo_url: str):
         with _jobs_lock:
             jobs[job_id]["status"] = "failed"
 
-
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
 @app.get("/")
 async def root():
     return {"status": "AI Code Review Agent is running", "version": "2.0.0"}
 
-
 @app.get("/health")
 async def health():
     with _jobs_lock:
         active = sum(1 for j in jobs.values() if j["status"] == "running")
-        total = len(jobs)
+        total  = len(jobs)
     return {
         "status": "ok",
-        "chromadb": CHROMA_STATUS["status"],   # ← deploy verification in one field
+        "chromadb": CHROMA_STATUS["status"],
         "active_jobs": active,
         "total_jobs": total,
         "groq_key_set": bool(os.getenv("GROQ_API_KEY")),
-
+    }
 
 @app.get("/ping")
 async def ping():
     return "pong"
-
 
 @app.post("/review", dependencies=[Depends(_verify_token)])
 async def start_review(req: ReviewRequest):
@@ -276,7 +277,7 @@ async def start_review(req: ReviewRequest):
             detail=f"Too many concurrent reviews ({active}/{MAX_CONCURRENT_REVIEWS}). Try again shortly."
         )
 
-    job_id = str(uuid.uuid4())   # full UUID — not truncated
+    job_id = str(uuid.uuid4())
     with _jobs_lock:
         jobs[job_id] = {
             "status":     "running",
@@ -294,7 +295,6 @@ async def start_review(req: ReviewRequest):
     t.start()
     return {"job_id": job_id, "status": "started"}
 
-
 @app.get("/review/{job_id}")
 async def get_review(job_id: str):
     with _jobs_lock:
@@ -304,7 +304,6 @@ async def get_review(job_id: str):
     if job["status"] != "complete":
         return {"status": job["status"]}
     return {"status": "complete", "result": job["result"]}
-
 
 @app.get("/review/{job_id}/stream")
 async def stream_review(job_id: str):
@@ -316,19 +315,17 @@ async def stream_review(job_id: str):
     async def event_generator():
         sent    = 0
         started = time.time()
-        timeout = 600  # 10 minutes hard cap
+        timeout = 600
 
         while time.time() - started < timeout:
             with _jobs_lock:
                 job_events = list(jobs.get(job_id, {}).get("events", []))
                 job_status = jobs.get(job_id, {}).get("status", "unknown")
 
-            # Drain any unsent events
             while sent < len(job_events):
                 yield f"data: {json.dumps(job_events[sent])}\n\n"
                 sent += 1
 
-            # Terminal states — flush remaining then close
             if job_status in ("complete", "failed"):
                 with _jobs_lock:
                     job_events = list(jobs.get(job_id, {}).get("events", []))
@@ -337,7 +334,6 @@ async def stream_review(job_id: str):
                     sent += 1
                 break
 
-            # SSE keep-alive comment (prevents proxies from closing idle connections)
             yield ": keep-alive\n\n"
             await asyncio.sleep(0.5)
 
