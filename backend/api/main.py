@@ -95,13 +95,12 @@ async def _self_ping():
 
 # ── Lifespan ───────────────────────────────────────────────────────────────────
 
+CHROMA_STATUS = {"status": "not checked"}
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Mark any jobs still "running" from a previous process as failed
-    with _jobs_lock:
-        for j in jobs.values():
-            if j["status"] == "running":
-                j["status"] = "failed"
+    from backend.core.chroma_client import probe
+    CHROMA_STATUS["status"] = probe()          # runs once at boot
     asyncio.create_task(_self_ping())
     yield
 
@@ -250,13 +249,13 @@ async def root():
 async def health():
     with _jobs_lock:
         active = sum(1 for j in jobs.values() if j["status"] == "running")
-        total  = len(jobs)
+        total = len(jobs)
     return {
         "status": "ok",
+        "chromadb": CHROMA_STATUS["status"],   # ← deploy verification in one field
         "active_jobs": active,
         "total_jobs": total,
         "groq_key_set": bool(os.getenv("GROQ_API_KEY")),
-    }
 
 
 @app.get("/ping")
