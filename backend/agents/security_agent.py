@@ -1,13 +1,9 @@
 """
-agents/security_agent.py  v3
-
-Improvements vs v2:
-  1. Test file filtering on static scan — expanded to cover more test patterns
-  2. Example code filtering — tutorial code like flask/examples not flagged as prod issues
-  3. File type context in LLM prompt
-  4. Smarter static scan — severity is contextual not always "high"
-  5. Better dedup — normalized title matching
-  6. Static scan results also filtered through test/example classifier
+agents/security_agent.py  v4 — PRODUCTION OPTIMIZED
+Fixes:
+  1. Added _is_placeholder() to ignore dummy/sample API keys (e.g., "your_api_key", "sk-xxxx")
+  2. Skip secret patterns entirely in test/example files
+  3. Smarter static scan with contextual severity
 """
 import json
 import re
@@ -48,21 +44,45 @@ Respond ONLY with valid JSON array:
 Only JSON. No markdown. Return [].
 """
 
+# Common placeholder patterns to IGNORE (prevents false positives on sample keys)
+PLACEHOLDER_PATTERNS = [
+    r'your[_-]?(?:api[_-]?key|key|token|password|secret)',
+    r'example[_-]?(?:key|token)',
+    r'sample[_-]?(?:key|token)',
+    r'dummy',
+    r'test[_-]?(?:key|token|password)',
+    r'changeme',
+    r'xxx+',
+    r'sk-xxxx',
+    r'pk-xxxx',
+    r'ghp_[a-zA-Z0-9]+',
+    r'placeholder',
+    r'insert[_-]?here',
+    r'<[^>]+>',  # e.g., <YOUR_API_KEY>
+]
+
+def _is_placeholder(value: str) -> bool:
+    val_lower = value.lower()
+    for pattern in PLACEHOLDER_PATTERNS:
+        if re.search(pattern, val_lower):
+            return True
+    return False
+
 # (pattern, title, suggestion, severity, skip_in_examples)
 SECRET_PATTERNS = [
     (
         r'(?i)(api_key|apikey|secret_key|password|passwd|token)\s*=\s*["\'][^"\']{8,}["\']',
         "Hardcoded secret or credential",
         "Move to environment variable: os.getenv('KEY_NAME'). Never commit secrets to git.",
-        "critical",
-        False,  # flag even in examples
+        "high",  # Downgraded from critical to allow LLM to assess real severity
+        True,    # SKIP in examples/tests
     ),
     (
         r'verify\s*=\s*False',
         "SSL verification disabled",
         "Remove verify=False. Use a proper CA bundle or fix certificate issues instead.",
         "high",
-        True,   # skip in test/example files
+        True,
     ),
     (
         r'pickle\.loads\s*\(',
@@ -90,7 +110,7 @@ SECRET_PATTERNS = [
         "Debug mode hardcoded to True",
         "Set via env var: DEBUG = os.getenv('DEBUG', 'false') == 'true'",
         "medium",
-        True,   # skip in example/tutorial configs
+        True,
     ),
     (
         r'os\.system\s*\(',
@@ -126,7 +146,6 @@ BASE_QUERIES = [
 _TEST_MARKERS    = {"test_", "_test", "tests/", "/tests/", "conftest", "fixtures"}
 _EXAMPLE_MARKERS = {"examples/", "/examples/", "tutorial/", "demo/", "sample/"}
 
-
 def _classify_file(filepath: str) -> str:
     fp = filepath.lower().replace("\\", "/")
     if any(m in fp for m in _TEST_MARKERS):
@@ -135,11 +154,9 @@ def _classify_file(filepath: str) -> str:
         return "EXAMPLE CODE"
     return "PRODUCTION"
 
-
 def _is_test_or_example(filepath: str) -> bool:
     fp = filepath.lower().replace("\\", "/")
     return any(m in fp for m in _TEST_MARKERS) or any(m in fp for m in _EXAMPLE_MARKERS)
-
 
 def _static_scan(all_chunks: list) -> list[Finding]:
     findings = []
@@ -153,6 +170,12 @@ def _static_scan(all_chunks: list) -> list[Finding]:
             if skip_in_examples and is_test_or_example:
                 continue
             for match in re.finditer(pattern, content):
+                matched_value = match.group()
+                
+                # CRITICAL FIX: Skip obvious placeholder/dummy values
+                if _is_placeholder(matched_value):
+                    continue
+                
                 line_num = content[: match.start()].count("\n") + 1
                 findings.append(Finding(
                     agent       ="security_agent",
@@ -161,21 +184,18 @@ def _static_scan(all_chunks: list) -> list[Finding]:
                     file        =filepath,
                     line        =line_num,
                     title       =title,
-                    description =f"Detected in {file_class}: `{match.group()[:80]}`",
+                    description =f"Detected in {file_class}: `{matched_value[:80]}`",
                     suggestion  =suggestion,
-                    code_snippet=match.group()[:120],
+                    code_snippet=matched_value[:120],
                 ))
     return findings
-
 
 def _should_skip_finding(fd: dict) -> bool:
     filepath = fd.get("file", "").lower().replace("\\", "/")
     return _is_test_or_example(filepath)
 
-
 def _normalize_title(title: str) -> str:
     return re.sub(r'\s+', ' ', title.lower().strip())
-
 
 def run_security_agent(state, collection, extra_queries=None):
     llm          = get_llm()
